@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Audio recordings
+recordings/
+*.wav
+
+# Credentials - IMPORTANT!
+config.py
+credentials.py
+
+# IDE
+.vscode/
+.idea/
+.obsidian/
+
+# Mac
+.DS_Store
+
+# Local directories
+bck/
+logs/
+.github/
+
+# Test scripts
+test_*.py
+
+# Notes
+*.md
+!README.md
+!RECEIVER.md
