@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     'pushover_device': 'a_phone',
     'record': False,
     'enable_healthcheck': True,
-    'heartbeat': 10,        # minutes
+    'heartbeat': 5,         # minutes
 }
 
 # State
@@ -60,7 +60,7 @@ log_lock = threading.Lock()
 
 # Patterns that indicate key events worth showing in the event log
 EVENT_PATTERNS = ['Baby started crying', 'Ignored brief sound', 'ALERT', 'Baby settled',
-                  'MICROPHONE SILENT', 'Microphone recovered', 'Heartbeat FAIL']
+                  'MICROPHONE SILENT', 'Microphone recovered', 'Heartbeat FAIL', 'Heartbeat failed']
 
 # ANSI color code stripping
 import re
@@ -91,6 +91,24 @@ def log_reader(process, log_file_path):
     except Exception as e:
         with log_lock:
             log_buffer.append(f"[ERROR] Log reader: {e}")
+
+def process_monitor(process):
+    """Monitor detector process and pause healthcheck if it exits on its own (e.g. auto-stop)."""
+    global detector_process
+    process.wait()  # Block until process exits
+    # Only act if this process is still the current one (not already stopped via web UI)
+    if detector_process is not None and detector_process.pid == process.pid:
+        detector_process = None
+        hc_paused = pause_healthcheck()
+        msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Detector exited (auto-stop)"
+        if hc_paused:
+            msg += " (healthcheck paused)"
+        with log_lock:
+            log_buffer.append(msg)
+            event_log_buffer.append(msg)
+        if LOG_FILE and os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'a') as f:
+                f.write(msg + "\n")
 
 def start_detector():
     """Start the cry detector process"""
@@ -156,6 +174,10 @@ def start_detector():
         # Start log reader thread
         log_thread = threading.Thread(target=log_reader, args=(detector_process, LOG_FILE), daemon=True)
         log_thread.start()
+
+        # Start process monitor thread (detects auto-stop and pauses healthcheck)
+        monitor_thread = threading.Thread(target=process_monitor, args=(detector_process,), daemon=True)
+        monitor_thread.start()
 
         return True, f"Detector started (log: {LOG_FILE})"
     except Exception as e:

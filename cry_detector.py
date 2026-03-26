@@ -294,22 +294,31 @@ class CryDetector:
             self.status_server = None
 
     def send_heartbeat(self):
-        """Send heartbeat ping to Healthchecks.io. Sends /fail if mic is silent."""
+        """Send heartbeat ping to Healthchecks.io. Sends /fail if mic is silent. Retries on failure."""
         if not self.healthcheck_url:
             return
-        try:
-            url = self.healthcheck_url
-            if self.mic_silent:
-                url = url.rstrip('/') + '/fail'
-            urllib.request.urlopen(url, timeout=10)
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            if self.mic_silent:
-                print(f"{RED}[{timestamp}] ♥ Heartbeat FAIL sent (mic silent){RESET}")
-            else:
-                print(f"{GREEN}[{timestamp}] ♥ Heartbeat sent{RESET}")
-        except Exception as e:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"{YELLOW}[{timestamp}] ⚠ Heartbeat failed: {e}{RESET}")
+        url = self.healthcheck_url
+        if self.mic_silent:
+            url = url.rstrip('/') + '/fail'
+        retry_delay = 30  # seconds
+        attempt = 0
+        while True:
+            try:
+                urllib.request.urlopen(url, timeout=10)
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                if self.mic_silent:
+                    print(f"{RED}[{timestamp}] ♥ Heartbeat FAIL sent (mic silent){RESET}")
+                else:
+                    msg = f"[{timestamp}] ♥ Heartbeat sent"
+                    if attempt > 0:
+                        msg += f" (after {attempt} {'retry' if attempt == 1 else 'retries'})"
+                    print(f"{GREEN}{msg}{RESET}")
+                return
+            except Exception as e:
+                attempt += 1
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                print(f"{YELLOW}[{timestamp}] ⚠ Heartbeat failed (retry in {retry_delay}s): {e}{RESET}")
+                time.sleep(retry_delay)
 
     def analyze_audio(self, audio_data):
         """Analyze audio chunk for crying"""
