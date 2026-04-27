@@ -463,6 +463,7 @@ HTML_TEMPLATE = """
     <div class="device-row">
         <button id="btn-h" class="btn-device {{ 'selected' if config.pushover_device == 'h_phone' else '' }}" onclick="selectDevice('h_phone')">mama</button>
         <button id="btn-a" class="btn-device {{ 'selected' if config.pushover_device == 'a_phone' else '' }}" onclick="selectDevice('a_phone')">papa</button>
+        <button id="btn-g" class="btn-device {{ 'selected' if config.pushover_device == 'grandma_phone' else '' }}" onclick="selectDevice('grandma_phone')">grandma</button>
     </div>
     <div class="restart-note">Alerts go to selected device. Switches instantly when running.</div>
 
@@ -579,6 +580,7 @@ HTML_TEMPLATE = """
             selectedDevice = device;
             document.getElementById('btn-h').classList.toggle('selected', device === 'h_phone');
             document.getElementById('btn-a').classList.toggle('selected', device === 'a_phone');
+            document.getElementById('btn-g').classList.toggle('selected', device === 'grandma_phone');
 
             // If running, update the device immediately
             if (isRunning) {
