@@ -36,9 +36,8 @@ LOG_FILE = None  # Will be set when detector starts
 DEFAULT_CONFIG = {
     'volume': 900,
     'cry_freq_min': 400,   # Hz
-    'ratio': 0.40,
-    'alert': 10,           # minutes
-    'reset': 10,           # minutes
+    'alert': 12,           # minutes
+    'reset': 5,           # minutes
     'min_cry': 4,          # seconds
     'silence_gap': 2,      # seconds
     'enable_stop_at': False,
@@ -246,15 +245,16 @@ def stop_detector():
         if LOG_FILE and os.path.exists(LOG_FILE):
             with open(LOG_FILE, 'a') as f:
                 f.write(stop_msg + "\n")
-            # Copy log to USB drive for backup
-            usb_log_dir = "/media/tinybaby/ESD-USB1/logs"
+            # Move log to USB drive for archival
+            usb_log_dir = "/media/tinybaby/usb-data/logs"
             try:
                 os.makedirs(usb_log_dir, exist_ok=True)
                 import shutil
                 shutil.copy2(LOG_FILE, usb_log_dir)
-                print(f"Log copied to {usb_log_dir}/{os.path.basename(LOG_FILE)}")
+                os.remove(LOG_FILE)
+                print(f"Log moved to {usb_log_dir}/{os.path.basename(LOG_FILE)}")
             except Exception as e:
-                print(f"Failed to copy log to USB: {e}")
+                print(f"Failed to move log to USB: {e}")
         return True, "Detector stopped"
     except Exception as e:
         return False, f"Failed to stop: {e}"
@@ -464,6 +464,7 @@ HTML_TEMPLATE = """
         <button id="btn-h" class="btn-device {{ 'selected' if config.pushover_device == 'h_phone' else '' }}" onclick="selectDevice('h_phone')">mama</button>
         <button id="btn-a" class="btn-device {{ 'selected' if config.pushover_device == 'a_phone' else '' }}" onclick="selectDevice('a_phone')">papa</button>
         <button id="btn-g" class="btn-device {{ 'selected' if config.pushover_device == 'grandma_phone' else '' }}" onclick="selectDevice('grandma_phone')">grandma</button>
+        <button id="btn-mute" class="btn-device {{ 'selected' if config.pushover_device == '__muted__' else '' }}" onclick="selectDevice('__muted__')">mute</button>
     </div>
     <div class="restart-note">Alerts go to selected device. Switches instantly when running.</div>
 
@@ -581,6 +582,7 @@ HTML_TEMPLATE = """
             document.getElementById('btn-h').classList.toggle('selected', device === 'h_phone');
             document.getElementById('btn-a').classList.toggle('selected', device === 'a_phone');
             document.getElementById('btn-g').classList.toggle('selected', device === 'grandma_phone');
+            document.getElementById('btn-mute').classList.toggle('selected', device === '__muted__');
 
             // If running, update the device immediately
             if (isRunning) {
@@ -729,15 +731,20 @@ HTML_TEMPLATE = """
             }
         }
 
+        function escapeHtml(s) {
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
         function colorLog(line) {
+            const safe = escapeHtml(line);
             if (line.includes('CRY') || line.includes('ALARM') || line.includes('crying')) {
-                return '<span class="log-cry">' + line + '</span>';
+                return '<span class="log-cry">' + safe + '</span>';
             } else if (line.includes('OK') || line.includes('settled') || line.includes('Started')) {
-                return '<span class="log-ok">' + line + '</span>';
+                return '<span class="log-ok">' + safe + '</span>';
             } else if (line.includes('Warning') || line.includes('Ignored')) {
-                return '<span class="log-warn">' + line + '</span>';
+                return '<span class="log-warn">' + safe + '</span>';
             }
-            return line;
+            return safe;
         }
 
         async function refreshStatus() {

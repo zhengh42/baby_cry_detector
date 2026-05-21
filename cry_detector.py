@@ -63,13 +63,13 @@ VOLUME_THRESHOLD = 800  # Lower threshold to catch quieter cries
 CRY_RATIO_THRESHOLD = 0.40  # Threshold for cry energy ratio
 SMOOTHING_WINDOW = 5  # Number of recent chunks to consider
 CRY_CONFIRMATION_COUNT = 2  # Need this many positive detections in window
-ALERT_WINDOW = 600  # Alert if crying actively happening at 10 minutes (wall clock time)
+ALERT_WINDOW = 720  # Alert if crying actively happening at 12 minutes (wall clock time)
 RESET_WINDOW = 300  # Reset after 5 minutes of silence
-MIN_CRY_DURATION = 10  # Seconds of sustained crying before announcing episode (filters brief sounds)
-SILENCE_GAP = 5  # Seconds of silence within crying that resets potential cry detection
+MIN_CRY_DURATION = 4  # Seconds of sustained crying before announcing episode (filters brief sounds)
+SILENCE_GAP = 2  # Seconds of silence within crying that resets potential cry detection
 
 # Recording settings
-RECORDINGS_DIR = '/media/tinybaby/ESD-USB/recordings'
+RECORDINGS_DIR = '/media/tinybaby/usb-data/recordings'
 RECORDING_GRACE_PERIOD = 10  # Keep recording for 10 seconds after crying stops
 MIN_RECORDING_DURATION = 10  # Only save recordings at least 10 seconds long
 MAX_RECORDING_FRAMES = 5000  # ~15 minutes at 44100/8192 (~5.4 chunks/sec) - prevents unbounded memory
@@ -165,7 +165,8 @@ class CryDetector:
         self.audio = _create_pyaudio_silently()
         self.stream = None
         self.initial_start_time = None  # When confirmed crying episode began
-        self.last_cry_time = None  # Most recent cry detection
+        self.last_cry_time = None  # Most recent confirmed cry detection
+        self.last_smoothed_cry_time = None  # Most recent smoothed detection (for brief sound logic)
         self.recent_detections = deque(maxlen=SMOOTHING_WINDOW)
         self.alert_sent = False  # Track if we've already alerted for this episode
         self.potential_cry_start_time = None  # When crying first detected (before confirmation)
@@ -229,8 +230,8 @@ class CryDetector:
                 return i
         return None
 
-    def start(self):
-        """Start the audio stream"""
+    def start_audio_stream(self):
+        """Start or restart just the audio stream (safe for reconnection)."""
         device_index = self.find_usb_audio_device()
         if device_index is None:
             print(f"{RED}✗ No USB audio device found. Available devices:{RESET}")
@@ -248,6 +249,10 @@ class CryDetector:
             input_device_index=device_index,
             frames_per_buffer=CHUNK
         )
+
+    def start(self):
+        """Start the audio stream, status server, and print config."""
+        self.start_audio_stream()
         self.session_start_time = time.time()
         print("Cry detector started. Monitoring audio...")
         print(f"Configuration: {self.cry_freq_min}-{CRY_FREQ_MAX} Hz, Chunk: {CHUNK} samples (~{CHUNK/RATE*1000:.0f}ms)")
@@ -294,31 +299,36 @@ class CryDetector:
             self.status_server = None
 
     def send_heartbeat(self):
-        """Send heartbeat ping to Healthchecks.io. Sends /fail if mic is silent. Retries on failure."""
+        """Send heartbeat ping in a background thread so retries don't block monitoring."""
         if not self.healthcheck_url:
             return
         url = self.healthcheck_url
         if self.mic_silent:
             url = url.rstrip('/') + '/fail'
-        retry_delay = 30  # seconds
-        attempt = 0
-        while True:
-            try:
-                urllib.request.urlopen(url, timeout=10)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                if self.mic_silent:
-                    print(f"{RED}[{timestamp}] ♥ Heartbeat FAIL sent (mic silent){RESET}")
-                else:
-                    msg = f"[{timestamp}] ♥ Heartbeat sent"
-                    if attempt > 0:
-                        msg += f" (after {attempt} {'retry' if attempt == 1 else 'retries'})"
-                    print(f"{GREEN}{msg}{RESET}")
-                return
-            except Exception as e:
-                attempt += 1
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                print(f"{YELLOW}[{timestamp}] ⚠ Heartbeat failed (retry in {retry_delay}s): {e}{RESET}")
-                time.sleep(retry_delay)
+        is_fail = self.mic_silent
+
+        def _send(url, is_fail):
+            retry_delay = 30  # seconds
+            attempt = 0
+            while True:
+                try:
+                    urllib.request.urlopen(url, timeout=10)
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    if is_fail:
+                        print(f"{RED}[{timestamp}] ♥ Heartbeat FAIL sent (mic silent){RESET}")
+                    else:
+                        msg = f"[{timestamp}] ♥ Heartbeat sent"
+                        if attempt > 0:
+                            msg += f" (after {attempt} {'retry' if attempt == 1 else 'retries'})"
+                        print(f"{GREEN}{msg}{RESET}")
+                    return
+                except Exception as e:
+                    attempt += 1
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    print(f"{YELLOW}[{timestamp}] ⚠ Heartbeat failed (retry in {retry_delay}s): {e}{RESET}")
+                    time.sleep(retry_delay)
+
+        threading.Thread(target=_send, args=(url, is_fail), daemon=True).start()
 
     def analyze_audio(self, audio_data):
         """Analyze audio chunk for crying"""
@@ -404,7 +414,7 @@ class CryDetector:
                     self.cleanup_stream()
                     time.sleep(2)
                     try:
-                        self.start()
+                        self.start_audio_stream()
                         continue
                     except Exception as reconnect_error:
                         print(f"{RED}✗ Reconnection failed: {reconnect_error}{RESET}")
@@ -460,14 +470,14 @@ class CryDetector:
                 if smoothed_crying:
                     if self.potential_cry_start_time is None:
                         self.potential_cry_start_time = current_time
-                    self.last_cry_time = current_time
+                    self.last_smoothed_cry_time = current_time
                 else:
                     # Check if brief silence should reset potential cry
-                    if self.potential_cry_start_time is not None and self.last_cry_time is not None:
-                        silence_duration = current_time - self.last_cry_time
+                    if self.potential_cry_start_time is not None and self.last_smoothed_cry_time is not None:
+                        silence_duration = current_time - self.last_smoothed_cry_time
                         if silence_duration >= self.silence_gap:
                             # Brief sound ended - not sustained crying
-                            brief_duration = self.last_cry_time - self.potential_cry_start_time
+                            brief_duration = self.last_smoothed_cry_time - self.potential_cry_start_time
                             if brief_duration < self.min_cry_duration:
                                 print(f"{YELLOW}⏭ Ignored brief sound ({brief_duration:.1f}s < {self.min_cry_duration}s){RESET}")
                             self.potential_cry_start_time = None
@@ -479,8 +489,9 @@ class CryDetector:
                     if sustained_duration >= self.min_cry_duration:
                         crying = True
 
-                # Update last detected cry time when confirmed crying
+                # Update last cry time when confirmed crying
                 if crying:
+                    self.last_cry_time = current_time
                     self.last_detected_cry_time = current_time
 
                 # Handle recording with grace period (only for confirmed crying)
@@ -532,8 +543,8 @@ class CryDetector:
                         print(f"\n{RED}[{timestamp}] 🚨 ALERT! Baby has been crying for {elapsed_time/60:.1f} minutes!{RESET}")
                         print(f"{RED}   (Episode started at {datetime.fromtimestamp(self.initial_start_time).strftime('%H:%M:%S')}, currently crying){RESET}")
 
-                        # Send EMERGENCY Pushover notification
-                        if self.pushover_client and self.enable_pushover:
+                        # Send EMERGENCY Pushover notification (skip if muted)
+                        if self.pushover_client and self.enable_pushover and self.pushover_device != '__muted__':
                             try:
                                 self.pushover_client.send_message(
                                     f"Baby has been crying for {elapsed_time/60:.1f} minutes! Please check on the baby.",
@@ -554,6 +565,8 @@ class CryDetector:
                                         print(f"{YELLOW}⚠ Healthcheck FAIL sent (Pushover delivery failed){RESET}")
                                     except Exception:
                                         pass
+                        elif self.pushover_device == '__muted__':
+                            print(f"{YELLOW}🔇 Notification muted{RESET}")
 
                         # Reset episode — if baby keeps crying, a new episode starts immediately
                         print(f"{YELLOW}   Episode reset. New episode starts if crying continues.{RESET}")
