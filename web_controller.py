@@ -470,7 +470,7 @@ HTML_TEMPLATE = """
 
     <div class="card">
         <h2>Configuration</h2>
-        <div class="restart-note">Restart to apply changes.</div>
+        <div class="restart-note">Changes apply instantly when running.</div>
         <div class="row">
             <div class="form-group">
                 <label>Volume Threshold</label>
@@ -526,6 +526,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <div class="restart-note">Stop At, Healthcheck, and Recording require restart.</div>
         <div class="form-group inline-option">
             <input type="checkbox" id="enable_stop_at" {{ 'checked' if config.enable_stop_at else '' }}>
             <label for="enable_stop_at" style="margin: 0; white-space: nowrap;">Stop At</label>
@@ -570,11 +571,22 @@ HTML_TEMPLATE = """
         let statusInterval = null;
         let selectedDevice = '{{ config.pushover_device }}';
 
-        function stepValue(id, delta) {
+        async function stepValue(id, delta) {
             const input = document.getElementById(id);
             let val = parseInt(input.value) || 0;
             val = Math.max(0, val + delta);
             input.value = val;
+            if (isRunning) {
+                try {
+                    await fetch('/api/config', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({[id]: val})
+                    });
+                } catch (e) {
+                    console.error('Failed to update config:', e);
+                }
+            }
         }
 
         async function selectDevice(device) {
@@ -857,13 +869,39 @@ def api_stop():
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def api_config():
-    """Get or update configuration"""
+    """Get or update configuration, forwarding to running detector"""
     global current_config
 
     if request.method == 'POST' and request.json:
         for key in request.json:
             if key in current_config:
                 current_config[key] = request.json[key]
+
+        # Forward to running detector if applicable
+        if is_running():
+            detector_config = {}
+            mapping = {
+                'volume': ('volume_threshold', lambda v: int(v)),
+                'cry_freq_min': ('cry_freq_min', lambda v: int(v)),
+                'alert': ('alert_window', lambda v: int(v) * 60),
+                'reset': ('reset_window', lambda v: int(v) * 60),
+                'min_cry': ('min_cry_duration', lambda v: int(v)),
+                'silence_gap': ('silence_gap', lambda v: int(v)),
+            }
+            for key, (attr, convert) in mapping.items():
+                if key in request.json:
+                    detector_config[attr] = convert(request.json[key])
+
+            if detector_config:
+                try:
+                    import urllib.request
+                    url = f"http://localhost:{current_config['status_port']}/config"
+                    data = json.dumps(detector_config).encode('utf-8')
+                    req = urllib.request.Request(url, data=data, method='POST')
+                    req.add_header('Content-Type', 'application/json')
+                    urllib.request.urlopen(req, timeout=2)
+                except Exception as e:
+                    print(f"Failed to forward config to detector: {e}")
 
     return jsonify(current_config)
 

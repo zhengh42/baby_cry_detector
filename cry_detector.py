@@ -143,6 +143,30 @@ def create_status_handler(detector):
                         old_device = detector.pushover_device
                         detector.pushover_device = config['pushover_device']
                         print(f"{GREEN}Pushover device changed: {old_device} -> {detector.pushover_device}{RESET}")
+                    if 'volume_threshold' in config:
+                        old = detector.volume_threshold
+                        detector.volume_threshold = int(config['volume_threshold'])
+                        print(f"{GREEN}Config: volume_threshold {old} -> {detector.volume_threshold}{RESET}")
+                    if 'cry_freq_min' in config:
+                        old = detector.cry_freq_min
+                        detector.cry_freq_min = int(config['cry_freq_min'])
+                        print(f"{GREEN}Config: cry_freq_min {old} -> {detector.cry_freq_min}{RESET}")
+                    if 'alert_window' in config:
+                        old = detector.alert_window
+                        detector.alert_window = int(config['alert_window'])
+                        print(f"{GREEN}Config: alert_window {old} -> {detector.alert_window}{RESET}")
+                    if 'reset_window' in config:
+                        old = detector.reset_window
+                        detector.reset_window = int(config['reset_window'])
+                        print(f"{GREEN}Config: reset_window {old} -> {detector.reset_window}{RESET}")
+                    if 'min_cry_duration' in config:
+                        old = detector.min_cry_duration
+                        detector.min_cry_duration = int(config['min_cry_duration'])
+                        print(f"{GREEN}Config: min_cry_duration {old} -> {detector.min_cry_duration}{RESET}")
+                    if 'silence_gap' in config:
+                        old = detector.silence_gap
+                        detector.silence_gap = int(config['silence_gap'])
+                        print(f"{GREEN}Config: silence_gap {old} -> {detector.silence_gap}{RESET}")
 
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -540,6 +564,7 @@ class CryDetector:
                     elapsed_time = current_time - self.initial_start_time
                     if elapsed_time >= self.alert_window and not self.alert_sent:
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
                         print(f"\n{RED}[{timestamp}] 🚨 ALERT! Baby has been crying for {elapsed_time/60:.1f} minutes!{RESET}")
                         print(f"{RED}   (Episode started at {datetime.fromtimestamp(self.initial_start_time).strftime('%H:%M:%S')}, currently crying){RESET}")
 
