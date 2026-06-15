@@ -17,9 +17,9 @@ That's it. No subscription, no cloud service, no camera. Everything runs locally
 2. The detector analyzes each audio chunk for crying frequency patterns
 3. Brief sounds like coughs or short fusses are filtered out — no alarm
 4. If crying is sustained (default: 4+ seconds), an episode begins and the web UI shows it
-5. If crying continues for the alert window (default: 10 minutes), an emergency Pushover notification is sent to the on-duty parent's phone
+5. If crying continues for the alert window (default: 12 minutes), an emergency Pushover notification is sent to the on-duty parent's phone
 6. The episode resets after the alarm — if the baby keeps crying, a new episode starts and another alarm will follow
-7. Once the baby settles and stays quiet (default: 10 minutes of silence), the episode ends
+7. Once the baby settles and stays quiet (default: 5 minutes of silence), the episode ends
 
 You control everything from a mobile-friendly web page on your phone — start/stop the monitor, choose who gets alerted, and watch the live status.
 
@@ -114,11 +114,11 @@ The recommended way to run the monitor. Open `http://<your-pi-ip>:5000` on your 
 - START/STOP/RESTART buttons for detector control
 - Live status display with emojis (sleeping/crying/alarm/mic silent)
 - Crying duration and silence timer in H:MM:SS format
-- "Who is on duty?" device selector — switch who gets alerted instantly
-- Configuration form for all detector parameters
-- Event log and real-time log viewer with auto-scroll
+- "Who is on duty?" device selector — switch who gets alerted instantly, or mute notifications entirely
+- Configuration form for all detector parameters — changes apply instantly to the running detector (no restart needed) and sync live across all open phones without refreshing
+- Event log and real-time log viewer with auto-scroll — configuration changes (alert/reset windows, device/mute switches, etc.) are recorded in the event log
 - Auto-pauses healthcheck when stopping (prevents false alerts)
-- Log files copied to USB drive on stop for backup
+- Log files moved to USB drive on stop for archival
 
 ### Cry Detector CLI (`cry_detector.py`)
 
@@ -130,15 +130,14 @@ python cry_detector.py --pushover --healthcheck https://hc-ping.com/your-uuid
 
 **Options:**
 - `-v, --volume` - Volume threshold
-- `-r, --ratio` - Cry frequency ratio threshold
 - `--cry-freq-min` - Minimum cry frequency in Hz
 - `--record` - Enable recording of crying episodes
 - `--pushover` - Enable Pushover emergency notifications
-- `--pushover-device` - Pushover device name to send to
-- `--alert` - Minutes of crying before alert
-- `--reset` - Minutes of silence before episode reset
-- `--min-cry` - Seconds of sustained crying before confirming episode
-- `--silence-gap` - Seconds of silence within crying that resets detection
+- `--pushover-device` - Pushover device name to send to (use `__muted__` to suppress notifications while still monitoring)
+- `--alert` - Minutes of crying before alert (default: 12)
+- `--reset` - Minutes of silence before episode reset (default: 5)
+- `--min-cry` - Seconds of sustained crying before confirming episode (default: 4)
+- `--silence-gap` - Seconds of silence within crying that resets detection (default: 2)
 - `--stop-at` - Time to auto-stop the script (HH:MM format, e.g. 07:00)
 - `--status-port` - Enable HTTP status server on this port
 - `--healthcheck` - Healthchecks.io ping URL for uptime monitoring

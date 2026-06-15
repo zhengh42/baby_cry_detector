@@ -68,6 +68,43 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 def strip_ansi(text):
     return ANSI_ESCAPE.sub('', text)
 
+# Human-readable labels and units for config keys, used in event-log messages
+CONFIG_LABELS = {
+    'volume': ('Volume threshold', ''),
+    'cry_freq_min': ('Cry freq min', ' Hz'),
+    'alert': ('Alert window', ' min'),
+    'reset': ('Reset window', ' min'),
+    'min_cry': ('Min cry duration', ' sec'),
+    'silence_gap': ('Silence gap', ' sec'),
+    'stop_at': ('Stop-at time', ''),
+    'status_port': ('Status port', ''),
+    'heartbeat': ('Heartbeat interval', ' min'),
+    'enable_stop_at': ('Stop-at', None),
+    'enable_healthcheck': ('Healthcheck', None),
+    'record': ('Recording', None),
+    'pushover': ('Pushover alerts', None),
+}
+
+def describe_config_change(key, old_value, new_value):
+    """Build a human-readable event-log message for a single config change."""
+    label, unit = CONFIG_LABELS.get(key, (key, ''))
+    if unit is None:  # boolean toggle
+        return f"Config: {label} {'ENABLED' if new_value else 'DISABLED'}"
+    return f"Config: {label} changed {old_value}{unit} -> {new_value}{unit}"
+
+def log_event(message):
+    """Record a key event (e.g. config change) to the log buffers and file."""
+    log_line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    with log_lock:
+        log_buffer.append(log_line)
+        event_log_buffer.append(log_line)
+    if LOG_FILE and os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, 'a') as f:
+                f.write(log_line + "\n")
+        except Exception:
+            pass
+
 def log_reader(process, log_file_path):
     """Read process output and store in log buffer and file"""
     global log_buffer
@@ -473,24 +510,6 @@ HTML_TEMPLATE = """
         <div class="restart-note">Changes apply instantly when running.</div>
         <div class="row">
             <div class="form-group">
-                <label>Volume Threshold</label>
-                <div class="stepper">
-                    <button type="button" class="stepper-btn" onclick="stepValue('volume', -100)">-</button>
-                    <input type="number" id="volume" value="{{ config.volume }}">
-                    <button type="button" class="stepper-btn" onclick="stepValue('volume', 100)">+</button>
-                </div>
-            </div>
-            <div class="form-group">
-                <label>Cry Freq Min (Hz)</label>
-                <div class="stepper">
-                    <button type="button" class="stepper-btn" onclick="stepValue('cry_freq_min', -100)">-</button>
-                    <input type="number" id="cry_freq_min" value="{{ config.cry_freq_min }}">
-                    <button type="button" class="stepper-btn" onclick="stepValue('cry_freq_min', 100)">+</button>
-                </div>
-            </div>
-        </div>
-        <div class="row">
-            <div class="form-group">
                 <label>Alert (min)</label>
                 <div class="stepper">
                     <button type="button" class="stepper-btn" onclick="stepValue('alert', -1)">-</button>
@@ -504,6 +523,24 @@ HTML_TEMPLATE = """
                     <button type="button" class="stepper-btn" onclick="stepValue('reset', -1)">-</button>
                     <input type="number" id="reset" value="{{ config.reset }}">
                     <button type="button" class="stepper-btn" onclick="stepValue('reset', 1)">+</button>
+                </div>
+            </div>
+        </div>
+        <div class="row">
+            <div class="form-group">
+                <label>Volume Threshold</label>
+                <div class="stepper">
+                    <button type="button" class="stepper-btn" onclick="stepValue('volume', -100)">-</button>
+                    <input type="number" id="volume" value="{{ config.volume }}">
+                    <button type="button" class="stepper-btn" onclick="stepValue('volume', 100)">+</button>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Cry Freq Min (Hz)</label>
+                <div class="stepper">
+                    <button type="button" class="stepper-btn" onclick="stepValue('cry_freq_min', -100)">-</button>
+                    <input type="number" id="cry_freq_min" value="{{ config.cry_freq_min }}">
+                    <button type="button" class="stepper-btn" onclick="stepValue('cry_freq_min', 100)">+</button>
                 </div>
             </div>
         </div>
@@ -759,11 +796,43 @@ HTML_TEMPLATE = """
             return safe;
         }
 
+        function syncConfigUI(config) {
+            if (!config) return;
+            // Update number/text fields, but never clobber a field the user is editing
+            const fields = ['volume', 'cry_freq_min', 'alert', 'reset', 'min_cry',
+                            'silence_gap', 'stop_at'];
+            for (const id of fields) {
+                const el = document.getElementById(id);
+                if (el && document.activeElement !== el && config[id] !== undefined
+                    && String(el.value) !== String(config[id])) {
+                    el.value = config[id];
+                }
+            }
+            // Update checkboxes
+            const checks = ['enable_stop_at', 'enable_healthcheck', 'record'];
+            for (const id of checks) {
+                const el = document.getElementById(id);
+                if (el && document.activeElement !== el && config[id] !== undefined
+                    && el.checked !== config[id]) {
+                    el.checked = config[id];
+                }
+            }
+            // Update device selection
+            if (config.pushover_device !== undefined && config.pushover_device !== selectedDevice) {
+                selectedDevice = config.pushover_device;
+                document.getElementById('btn-h').classList.toggle('selected', selectedDevice === 'h_phone');
+                document.getElementById('btn-a').classList.toggle('selected', selectedDevice === 'a_phone');
+                document.getElementById('btn-g').classList.toggle('selected', selectedDevice === 'grandma_phone');
+                document.getElementById('btn-mute').classList.toggle('selected', selectedDevice === '__muted__');
+            }
+        }
+
         async function refreshStatus() {
             try {
                 const resp = await fetch('/api/status');
                 const data = await resp.json();
                 updateUI(data.running, data.baby_status);
+                syncConfigUI(data.config);
 
                 const eventsDiv = document.getElementById('events');
                 const eventsAutoScroll = document.getElementById('events-auto-scroll').checked;
@@ -819,7 +888,8 @@ def api_status():
         'running': running,
         'baby_status': baby_status,
         'events': events,
-        'logs': logs
+        'logs': logs,
+        'config': current_config
     })
 
 @app.route('/api/device', methods=['POST'])
@@ -832,6 +902,17 @@ def api_device():
 
     if request.json and 'pushover_device' in request.json:
         device = request.json['pushover_device']
+        old_device = current_config['pushover_device']
+        if device != old_device:
+            DEVICE_LABELS = {'h_phone': 'mama', 'a_phone': 'papa',
+                             'grandma_phone': 'grandma', '__muted__': 'muted'}
+            if device == '__muted__':
+                log_event("Config: Pushover alerts MUTED")
+            elif old_device == '__muted__':
+                log_event(f"Config: Pushover alerts UNMUTED ({DEVICE_LABELS.get(device, device)})")
+            else:
+                log_event(f"Config: Pushover device changed "
+                          f"{DEVICE_LABELS.get(old_device, old_device)} -> {DEVICE_LABELS.get(device, device)}")
         current_config['pushover_device'] = device
 
         # Forward to detector's config endpoint
@@ -875,7 +956,11 @@ def api_config():
     if request.method == 'POST' and request.json:
         for key in request.json:
             if key in current_config:
-                current_config[key] = request.json[key]
+                old_value = current_config[key]
+                new_value = request.json[key]
+                if old_value != new_value:
+                    log_event(describe_config_change(key, old_value, new_value))
+                current_config[key] = new_value
 
         # Forward to running detector if applicable
         if is_running():
