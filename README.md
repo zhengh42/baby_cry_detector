@@ -69,7 +69,20 @@ HEALTHCHECK_URL = "https://hc-ping.com/your-uuid"
 HEALTHCHECK_API_KEY = "your-api-key"
 ```
 
-### 4. Set up systemd service (recommended)
+### 4. Password-protect the web UI (optional)
+
+By default the web interface is open to anyone on your WiFi, who could mute alerts or
+retune detection. To require a password, add to `config.py`:
+
+```python
+WEB_PASSWORD = "your_password"
+WEB_USERNAME = "baby"   # optional, defaults to "baby"
+```
+
+Leave it out and no password is asked for. The detector's own status port is bound to
+localhost only, so it is not reachable from other machines regardless.
+
+### 5. Set up systemd service (recommended)
 
 Systemd makes the web controller start automatically on boot and restart if it crashes.
 
@@ -112,11 +125,15 @@ The recommended way to run the monitor. Open `http://<your-pi-ip>:5000` on your 
 <img src="screenshots/web-ui.JPG" alt="Web Interface" width="50%">
 
 - START/STOP/RESTART buttons for detector control
-- Live status display with emojis (sleeping/crying/alarm/mic silent)
+- Live status display with emojis (sleeping/crying/alarm/mic silent/no audio)
 - Crying duration and silence timer in H:MM:SS format
 - "Who is on duty?" device selector — switch who gets alerted instantly, or mute notifications entirely
 - Configuration form for all detector parameters — changes apply instantly to the running detector (no restart needed) and sync live across all open phones without refreshing
 - Event log and real-time log viewer with auto-scroll — configuration changes (alert/reset windows, device/mute switches, etc.) are recorded in the event log
+- Settings persist across restarts and reboots (saved to `monitor_config.json`)
+- Event log is kept across detector sessions, and config changes are also appended to `/var/log/babymonitor/controller.log`
+- Shows NO AUDIO if the detector loses the microphone, instead of reporting "all quiet"
+- Red banner if the detector exits unexpectedly (crash, bad setting), with the error and a Dismiss button; the healthcheck is only paused on a clean stop, so a crash still escalates
 - Auto-pauses healthcheck when stopping (prevents false alerts)
 - Log files moved to USB drive on stop for archival
 
@@ -140,6 +157,7 @@ python cry_detector.py --pushover --healthcheck https://hc-ping.com/your-uuid
 - `--silence-gap` - Seconds of silence within crying that resets detection (default: 2)
 - `--stop-at` - Time to auto-stop the script (HH:MM format, e.g. 07:00)
 - `--status-port` - Enable HTTP status server on this port
+- `--status-bind` - Address for the status server (default: `127.0.0.1`; use `0.0.0.0` to let other machines read it, e.g. the optional receiver)
 - `--healthcheck` - Healthchecks.io ping URL for uptime monitoring
 - `--heartbeat` - Heartbeat interval in minutes (default: 5)
 

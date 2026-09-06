@@ -12,6 +12,9 @@ recordings/
 config.py
 credentials.py
 
+# Persisted runtime settings
+monitor_config.json
+
 # IDE
 .vscode/
 .idea/

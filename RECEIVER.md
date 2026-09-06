@@ -27,6 +27,10 @@ Systemd-friendly launcher for receiver.py. Features:
 pip install rainbowhat
 ```
 
+**Note:** the detector binds its status port to localhost by default, so the monitor Pi
+must be started with `--status-bind 0.0.0.0` for the receiver to reach it. With the web
+controller, add that flag to the command it builds in `start_detector()`.
+
 ## Usage
 
 ```bash

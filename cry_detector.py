@@ -27,11 +27,13 @@ def _create_pyaudio_silently():
     return audio
 
 
+import argparse
 from collections import deque
 import time
 import wave
 import urllib.request
 import json
+import signal
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
@@ -72,19 +74,74 @@ SILENCE_GAP = 2  # Seconds of silence within crying that resets potential cry de
 RECORDINGS_DIR = '/media/tinybaby/usb-data/recordings'
 RECORDING_GRACE_PERIOD = 10  # Keep recording for 10 seconds after crying stops
 MIN_RECORDING_DURATION = 10  # Only save recordings at least 10 seconds long
-MAX_RECORDING_FRAMES = 5000  # ~15 minutes at 44100/8192 (~5.4 chunks/sec) - prevents unbounded memory
+# ~15 minutes at 44100/8192 (~5.4 chunks/sec). Frames are held in RAM until the
+# episode ends, so this caps one episode at roughly 82 MB (5000 * 8192 * 2 bytes).
+MAX_RECORDING_FRAMES = 5000
 
 # Pushover emergency notification settings
 PUSHOVER_RETRY = 30   # Retry every 30 seconds if not acknowledged
 PUSHOVER_EXPIRE = 3600  # Give up after 1 hour
-ENABLE_PUSHOVER = True and PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN  # Auto-disable if credentials missing
 
 # Silent mic detection
 MIC_SILENT_THRESHOLD = 5  # Volume below this is considered "dead silence"
 MIC_SILENT_DURATION = 300  # 5 minutes of dead silence triggers alert
+STREAM_ERROR_LOG_INTERVAL = 60  # Seconds between repeated audio-stream error lines
 
-# Default HTTP status server port
+# Default HTTP status server port, bound to localhost only: the web controller is
+# the only local consumer, and an open port means anyone on the WiFi can retune or
+# mute the monitor. Pass --status-bind 0.0.0.0 to expose it (e.g. for receiver.py).
 DEFAULT_STATUS_PORT = 8080
+DEFAULT_STATUS_BIND = '127.0.0.1'
+
+# Accepted range for each setting, as (minimum, maximum). Mirrors CONFIG_LIMITS in
+# web_controller.py; zero or negative values break detection (alert_window=0 would
+# alert on every audio chunk), so both the CLI and /config clamp or reject.
+VOLUME_RANGE = (50, 30000)
+CRY_FREQ_MIN_RANGE = (100, 1900)  # must stay under CRY_FREQ_MAX
+RATIO_RANGE = (0.05, 0.95)
+ALERT_MINUTES_RANGE = (1, 240)
+RESET_MINUTES_RANGE = (1, 240)
+MIN_CRY_RANGE = (1, 300)          # seconds
+SILENCE_GAP_RANGE = (1, 120)      # seconds
+HEARTBEAT_MINUTES_RANGE = (1, 60)
+STATUS_PORT_RANGE = (1024, 65535)
+
+# Live-tunable via POST /config: request key -> (attribute, coerce, minimum, maximum).
+# Windows arrive in seconds here, unlike the CLI which takes minutes.
+LIVE_CONFIG_FIELDS = {
+    'volume_threshold': ('volume_threshold', int) + VOLUME_RANGE,
+    'cry_freq_min': ('cry_freq_min', int) + CRY_FREQ_MIN_RANGE,
+    'alert_window': ('alert_window', int, ALERT_MINUTES_RANGE[0] * 60, ALERT_MINUTES_RANGE[1] * 60),
+    'reset_window': ('reset_window', int, RESET_MINUTES_RANGE[0] * 60, RESET_MINUTES_RANGE[1] * 60),
+    'min_cry_duration': ('min_cry_duration', int) + MIN_CRY_RANGE,
+    'silence_gap': ('silence_gap', int) + SILENCE_GAP_RANGE,
+}
+
+
+def bounded_int(low, high):
+    """argparse type that rejects out-of-range integers with a clear message."""
+    def parse(text):
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"'{text}' is not an integer")
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low} and {high}, got {value}")
+        return value
+    return parse
+
+
+def bounded_float(low, high):
+    """argparse type that rejects out-of-range floats with a clear message."""
+    def parse(text):
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"'{text}' is not a number")
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low} and {high}, got {value}")
+        return value
+    return parse
 
 
 def create_status_handler(detector):
@@ -113,10 +170,18 @@ def create_status_handler(detector):
                     if ref_time:
                         silence_since = time.time() - ref_time
 
+                # Audio stream health, so consumers can tell "all quiet" apart
+                # from "not listening at all"
+                seconds_since_audio = None
+                if detector.last_chunk_time is not None:
+                    seconds_since_audio = round(time.time() - detector.last_chunk_time, 1)
+
                 status = {
                     "crying": detector.initial_start_time is not None,
-                    "alarm": detector.alert_sent,
+                    "alarm": detector.alarm_active,
                     "mic_silent": detector.mic_silent,
+                    "stream_ok": detector.stream_ok,
+                    "seconds_since_audio": seconds_since_audio,
                     "episode_duration": round(episode_duration, 1),
                     "since_last_cry": round(since_last_cry, 1),
                     "silence_since": round(silence_since, 1),
@@ -133,54 +198,61 @@ def create_status_handler(detector):
                 self.end_headers()
 
         def do_POST(self):
-            if self.path == '/config':
-                content_length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(content_length).decode('utf-8')
-                try:
-                    config = json.loads(body)
-                    # Update pushover device if provided
-                    if 'pushover_device' in config:
-                        old_device = detector.pushover_device
-                        detector.pushover_device = config['pushover_device']
-                        print(f"{GREEN}Pushover device changed: {old_device} -> {detector.pushover_device}{RESET}")
-                    if 'volume_threshold' in config:
-                        old = detector.volume_threshold
-                        detector.volume_threshold = int(config['volume_threshold'])
-                        print(f"{GREEN}Config: volume_threshold {old} -> {detector.volume_threshold}{RESET}")
-                    if 'cry_freq_min' in config:
-                        old = detector.cry_freq_min
-                        detector.cry_freq_min = int(config['cry_freq_min'])
-                        print(f"{GREEN}Config: cry_freq_min {old} -> {detector.cry_freq_min}{RESET}")
-                    if 'alert_window' in config:
-                        old = detector.alert_window
-                        detector.alert_window = int(config['alert_window'])
-                        print(f"{GREEN}Config: alert_window {old} -> {detector.alert_window}{RESET}")
-                    if 'reset_window' in config:
-                        old = detector.reset_window
-                        detector.reset_window = int(config['reset_window'])
-                        print(f"{GREEN}Config: reset_window {old} -> {detector.reset_window}{RESET}")
-                    if 'min_cry_duration' in config:
-                        old = detector.min_cry_duration
-                        detector.min_cry_duration = int(config['min_cry_duration'])
-                        print(f"{GREEN}Config: min_cry_duration {old} -> {detector.min_cry_duration}{RESET}")
-                    if 'silence_gap' in config:
-                        old = detector.silence_gap
-                        detector.silence_gap = int(config['silence_gap'])
-                        print(f"{GREEN}Config: silence_gap {old} -> {detector.silence_gap}{RESET}")
-
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"success": True}).encode())
-                except json.JSONDecodeError:
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
-            else:
+            if self.path != '/config':
                 self.send_response(404)
                 self.end_headers()
+                return
+
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8', errors='replace')
+            try:
+                config = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
+                return
+            if not isinstance(config, dict):
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Expected a JSON object"}).encode())
+                return
+
+            rejected = []
+
+            if 'pushover_device' in config:
+                device = config['pushover_device']
+                if isinstance(device, str):
+                    old_device = detector.pushover_device
+                    detector.pushover_device = device
+                    print(f"{GREEN}Pushover device changed: {old_device} -> {device}{RESET}")
+                else:
+                    rejected.append('pushover_device')
+
+            for key, (attr, coerce, low, high) in LIVE_CONFIG_FIELDS.items():
+                if key not in config:
+                    continue
+                try:
+                    value = coerce(config[key])
+                except (TypeError, ValueError):
+                    rejected.append(key)
+                    continue
+                clamped = max(low, min(high, value))
+                old = getattr(detector, attr)
+                setattr(detector, attr, clamped)
+                note = f" (clamped from {value})" if clamped != value else ""
+                print(f"{GREEN}Config: {key} {old} -> {clamped}{note}{RESET}")
+
+            if rejected:
+                print(f"{YELLOW}Config: ignored invalid values for {', '.join(rejected)}{RESET}")
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "rejected": rejected}).encode())
     return StatusHandler
 
 
@@ -192,13 +264,14 @@ class CryDetector:
         self.last_cry_time = None  # Most recent confirmed cry detection
         self.last_smoothed_cry_time = None  # Most recent smoothed detection (for brief sound logic)
         self.recent_detections = deque(maxlen=SMOOTHING_WINDOW)
-        self.alert_sent = False  # Track if we've already alerted for this episode
+        self.alarm_active = False  # True once an alert has fired, until the baby settles
         self.potential_cry_start_time = None  # When crying first detected (before confirmation)
         self.session_start_time = None  # When the detector session started
         self.last_episode_end_time = None  # When the last crying episode ended
         
         # Recording state - only record during crying episodes
         self.is_recording = False
+        self.recording_truncated = False  # True once an episode hit the memory cap
         self.current_episode_frames = []
         self.episode_start_time = None
         self.last_detected_cry_time = None  # For grace period
@@ -227,11 +300,17 @@ class CryDetector:
         # HTTP status server settings
         self.status_server = None
         self.status_port = DEFAULT_STATUS_PORT
+        self.status_bind = DEFAULT_STATUS_BIND
         self.enable_status_server = False
 
         # Silent mic detection
         self.mic_silent_since = None  # When consecutive dead silence started
         self.mic_silent = False  # True when mic appears dead
+
+        # Audio stream health
+        self.stream_ok = True
+        self.last_chunk_time = None  # Last successful chunk read
+        self.last_stream_error_log = None  # For throttling error output
 
         # Initialize Pushover client
         if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN:
@@ -245,24 +324,26 @@ class CryDetector:
             self.pushover_client = None
             print(f"{YELLOW}⚠ Pushover credentials not found - notifications disabled{RESET}")
 
-    def find_usb_audio_device(self):
+    def find_usb_audio_device(self, verbose=True):
         """Find USB audio device index by name"""
         for i in range(self.audio.get_device_count()):
             info = self.audio.get_device_info_by_index(i)
             if 'USB' in info['name'] and info['maxInputChannels'] > 0:
-                print(f"{GREEN}✓ Found USB audio device: {info['name']} (index {i}){RESET}")
+                if verbose:
+                    print(f"{GREEN}✓ Found USB audio device: {info['name']} (index {i}){RESET}")
                 return i
         return None
 
-    def start_audio_stream(self):
+    def start_audio_stream(self, verbose=True):
         """Start or restart just the audio stream (safe for reconnection)."""
-        device_index = self.find_usb_audio_device()
+        device_index = self.find_usb_audio_device(verbose=verbose)
         if device_index is None:
-            print(f"{RED}✗ No USB audio device found. Available devices:{RESET}")
-            for i in range(self.audio.get_device_count()):
-                info = self.audio.get_device_info_by_index(i)
-                if info['maxInputChannels'] > 0:
-                    print(f"  [{i}] {info['name']}")
+            if verbose:
+                print(f"{RED}✗ No USB audio device found. Available devices:{RESET}")
+                for i in range(self.audio.get_device_count()):
+                    info = self.audio.get_device_info_by_index(i)
+                    if info['maxInputChannels'] > 0:
+                        print(f"  [{i}] {info['name']}")
             raise RuntimeError("No USB audio device found")
 
         self.stream = self.audio.open(
@@ -273,6 +354,28 @@ class CryDetector:
             input_device_index=device_index,
             frames_per_buffer=CHUNK
         )
+
+    def log_stream_error(self, message):
+        """Print an audio-stream error, throttled so a dead mic can't flood the log."""
+        now = time.time()
+        if (self.last_stream_error_log is not None
+                and (now - self.last_stream_error_log) < STREAM_ERROR_LOG_INTERVAL):
+            return
+        self.last_stream_error_log = now
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{RED}[{timestamp}] ✗ {message}{RESET}")
+
+    def reset_audio_backend(self):
+        """Re-create the PyAudio instance so a re-plugged USB mic is rediscovered.
+
+        PyAudio enumerates devices at init, so a mic unplugged and plugged back in
+        is invisible until the backend is torn down and rebuilt.
+        """
+        try:
+            self.audio.terminate()
+        except Exception:
+            pass
+        self.audio = _create_pyaudio_silently()
 
     def start(self):
         """Start the audio stream, status server, and print config."""
@@ -305,21 +408,25 @@ class CryDetector:
             print(f"{YELLOW}Healthcheck: Disabled (use --healthcheck URL to enable){RESET}")
         if self.enable_status_server:
             self.start_status_server()
-            print(f"{GREEN}Status server: http://0.0.0.0:{self.status_port}/status{RESET}")
+            print(f"{GREEN}Status server: http://{self.status_bind}:{self.status_port}/status{RESET}")
         else:
             print(f"{YELLOW}Status server: Disabled (use --status-port PORT to enable){RESET}")
 
     def start_status_server(self):
         """Start the HTTP status server in a background thread"""
         handler = create_status_handler(self)
-        self.status_server = HTTPServer(('0.0.0.0', self.status_port), handler)
+        self.status_server = HTTPServer((self.status_bind, self.status_port), handler)
         thread = threading.Thread(target=self.status_server.serve_forever, daemon=True)
         thread.start()
 
     def stop_status_server(self):
-        """Stop the HTTP status server"""
+        """Stop the HTTP status server and release its port"""
         if self.status_server:
             self.status_server.shutdown()
+            # shutdown() only stops serve_forever. Dropping the reference below
+            # happens to close the socket under CPython refcounting, but closing
+            # it explicitly is deterministic and avoids a ResourceWarning.
+            self.status_server.server_close()
             self.status_server = None
 
     def send_heartbeat(self):
@@ -327,19 +434,23 @@ class CryDetector:
         if not self.healthcheck_url:
             return
         url = self.healthcheck_url
-        if self.mic_silent:
+        is_fail = self.mic_silent or not self.stream_ok
+        if is_fail:
             url = url.rstrip('/') + '/fail'
-        is_fail = self.mic_silent
 
         def _send(url, is_fail):
             retry_delay = 30  # seconds
+            # Give up before the next heartbeat is due, otherwise a long outage
+            # leaves one retrying thread per interval, all pinging on recovery
+            deadline = time.time() + max(self.heartbeat_interval, retry_delay)
             attempt = 0
             while True:
                 try:
                     urllib.request.urlopen(url, timeout=10)
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     if is_fail:
-                        print(f"{RED}[{timestamp}] ♥ Heartbeat FAIL sent (mic silent){RESET}")
+                        reason = "mic silent" if self.mic_silent else "audio stream down"
+                        print(f"{RED}[{timestamp}] ♥ Heartbeat FAIL sent ({reason}){RESET}")
                     else:
                         msg = f"[{timestamp}] ♥ Heartbeat sent"
                         if attempt > 0:
@@ -349,10 +460,24 @@ class CryDetector:
                 except Exception as e:
                     attempt += 1
                     timestamp = datetime.now().strftime("%H:%M:%S")
+                    if time.time() + retry_delay >= deadline:
+                        print(f"{YELLOW}[{timestamp}] ⚠ Heartbeat failed after {attempt} "
+                              f"{'try' if attempt == 1 else 'tries'}, giving up until next "
+                              f"heartbeat: {e}{RESET}")
+                        return
                     print(f"{YELLOW}[{timestamp}] ⚠ Heartbeat failed (retry in {retry_delay}s): {e}{RESET}")
                     time.sleep(retry_delay)
 
         threading.Thread(target=_send, args=(url, is_fail), daemon=True).start()
+
+    def maybe_send_heartbeat(self, current_time):
+        """Send a heartbeat if enabled and the interval has elapsed."""
+        if not self.healthcheck_url:
+            return
+        if (self.last_heartbeat_time is None
+                or (current_time - self.last_heartbeat_time) >= self.heartbeat_interval):
+            self.send_heartbeat()
+            self.last_heartbeat_time = current_time
 
     def analyze_audio(self, audio_data):
         """Analyze audio chunk for crying"""
@@ -429,26 +554,8 @@ class CryDetector:
         """Main monitoring loop"""
         try:
             while True:
-                # Read audio chunk with reconnection on failure
-                try:
-                    audio_data = self.stream.read(CHUNK, exception_on_overflow=False)
-                except (IOError, OSError) as e:
-                    print(f"{RED}✗ Audio stream error: {e}{RESET}")
-                    print(f"{YELLOW}Attempting to reconnect...{RESET}")
-                    self.cleanup_stream()
-                    time.sleep(2)
-                    try:
-                        self.start_audio_stream()
-                        continue
-                    except Exception as reconnect_error:
-                        print(f"{RED}✗ Reconnection failed: {reconnect_error}{RESET}")
-                        time.sleep(5)
-                        continue
-
-                self.chunk_count += 1
-                current_time = time.time()
-
-                # Check if we should auto-stop
+                # Auto-stop and heartbeats run first so they keep working even
+                # while the audio stream is down
                 if self.stop_time:
                     now = datetime.now().time()
                     # Stop if current time matches stop time (within 1-second window)
@@ -457,11 +564,42 @@ class CryDetector:
                         print(f"\n{GREEN}[{timestamp}] Auto-stop time reached ({self.stop_time.strftime('%H:%M')}). Shutting down...{RESET}")
                         break
 
-                # Send heartbeat if enabled and interval has elapsed
-                if self.healthcheck_url:
-                    if self.last_heartbeat_time is None or (current_time - self.last_heartbeat_time) >= self.heartbeat_interval:
-                        self.send_heartbeat()
-                        self.last_heartbeat_time = current_time
+                # Send heartbeat if enabled and interval has elapsed (sent as a /fail
+                # ping while the stream is down, so a dead mic surfaces without
+                # waiting for the healthchecks.io period to expire)
+                self.maybe_send_heartbeat(time.time())
+
+                # (Re)open the stream if a previous read or reconnect failed
+                if self.stream is None:
+                    try:
+                        self.start_audio_stream(verbose=False)
+                    except Exception as reconnect_error:
+                        self.log_stream_error(f"Reconnection failed: {reconnect_error}")
+                        # PyAudio caches the device list, so rebuild it to notice a re-plug
+                        self.reset_audio_backend()
+                        time.sleep(5)
+                        continue
+
+                # Read audio chunk; on failure drop the stream and reconnect next pass
+                try:
+                    audio_data = self.stream.read(CHUNK, exception_on_overflow=False)
+                except (IOError, OSError) as e:
+                    # Mark the stream down so /status stops reporting stale "all quiet"
+                    self.stream_ok = False
+                    self.log_stream_error(f"Audio stream error: {e} - attempting to reconnect")
+                    self.cleanup_stream()
+                    time.sleep(2)
+                    continue
+
+                if not self.stream_ok:
+                    self.stream_ok = True
+                    self.last_stream_error_log = None
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"\n{GREEN}[{timestamp}] ✓ Audio stream recovered{RESET}")
+
+                self.last_chunk_time = time.time()
+                self.chunk_count += 1
+                current_time = time.time()
 
                 # Analyze for crying
                 is_crying_now, volume, freq, ratio = self.analyze_audio(audio_data)
@@ -524,12 +662,17 @@ class CryDetector:
                         # Start recording this episode
                         self.is_recording = True
                         self.episode_start_time = current_time
+                        self.recording_truncated = False
                         self.current_episode_frames = []
                         print(f"{YELLOW}📹 Started recording episode{RESET}")
 
                     # Add audio chunk to current episode (with memory limit)
                     if len(self.current_episode_frames) < MAX_RECORDING_FRAMES:
                         self.current_episode_frames.append(audio_data)
+                    elif not self.recording_truncated:
+                        self.recording_truncated = True
+                        print(f"{YELLOW}⚠ Recording hit the {MAX_RECORDING_FRAMES}-chunk "
+                              f"memory cap; the rest of this episode is not recorded{RESET}")
 
                 elif self.enable_recording and self.is_recording:
                     # Not currently crying but we're recording
@@ -555,15 +698,16 @@ class CryDetector:
                     # Set initial start time if this is a new episode
                     if self.initial_start_time is None:
                         self.initial_start_time = self.potential_cry_start_time
-                        self.alert_sent = False
+                        self.alarm_active = False
                         sustained_duration = current_time - self.potential_cry_start_time
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         print(f"\n{RED}[{timestamp}] 🙁 Baby started crying! (sustained for {sustained_duration:.1f}s, Vol: {volume:.0f}, Freq: {freq:.1f} Hz){RESET}")
 
                     # Check if we should alert
                     elapsed_time = current_time - self.initial_start_time
-                    if elapsed_time >= self.alert_window and not self.alert_sent:
+                    if elapsed_time >= self.alert_window:
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.alarm_active = True
 
                         print(f"\n{RED}[{timestamp}] 🚨 ALERT! Baby has been crying for {elapsed_time/60:.1f} minutes!{RESET}")
                         print(f"{RED}   (Episode started at {datetime.fromtimestamp(self.initial_start_time).strftime('%H:%M:%S')}, currently crying){RESET}")
@@ -597,7 +741,6 @@ class CryDetector:
                         print(f"{YELLOW}   Episode reset. New episode starts if crying continues.{RESET}")
                         self.last_episode_end_time = self.last_cry_time
                         self.initial_start_time = current_time
-                        self.alert_sent = False
                         self.potential_cry_start_time = current_time
 
                 else:
@@ -617,7 +760,7 @@ class CryDetector:
                             self.initial_start_time = None
                             self.last_cry_time = None
                             self.potential_cry_start_time = None
-                            self.alert_sent = False
+                            self.alarm_active = False
 
         except KeyboardInterrupt:
             print(f"\n\n{YELLOW}Stopping cry detector...{RESET}")
@@ -650,14 +793,12 @@ class CryDetector:
         self.audio.terminate()
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description='Baby cry detector with USB audio and Pushover notifications')
-    parser.add_argument('-v', '--volume', type=int, default=VOLUME_THRESHOLD,
+    parser.add_argument('-v', '--volume', type=bounded_int(*VOLUME_RANGE), default=VOLUME_THRESHOLD,
                         help=f'Volume threshold (default: {VOLUME_THRESHOLD})')
-    parser.add_argument('--cry-freq-min', type=int, default=CRY_FREQ_MIN,
+    parser.add_argument('--cry-freq-min', type=bounded_int(*CRY_FREQ_MIN_RANGE), default=CRY_FREQ_MIN,
                         help=f'Minimum cry frequency in Hz (default: {CRY_FREQ_MIN})')
-    parser.add_argument('-r', '--ratio', type=float, default=CRY_RATIO_THRESHOLD,
+    parser.add_argument('-r', '--ratio', type=bounded_float(*RATIO_RANGE), default=CRY_RATIO_THRESHOLD,
                         help=f'Cry ratio threshold (default: {CRY_RATIO_THRESHOLD})')
     parser.add_argument('--record', action='store_true', default=False,
                         help='Enable recording of crying episodes (default: disabled)')
@@ -665,30 +806,40 @@ if __name__ == "__main__":
                         help='Enable Pushover emergency notifications (default: disabled)')
     parser.add_argument('--pushover-device', type=str, default=None,
                         help='Pushover device name to send to (default: all devices)')
-    parser.add_argument('--alert', type=int, default=ALERT_WINDOW // 60,
+    parser.add_argument('--alert', type=bounded_int(*ALERT_MINUTES_RANGE), default=ALERT_WINDOW // 60,
                         help=f'Minutes of crying before alert (default: {ALERT_WINDOW // 60})')
-    parser.add_argument('--reset', type=int, default=RESET_WINDOW // 60,
+    parser.add_argument('--reset', type=bounded_int(*RESET_MINUTES_RANGE), default=RESET_WINDOW // 60,
                         help=f'Minutes of silence before episode reset (default: {RESET_WINDOW // 60})')
-    parser.add_argument('--min-cry', type=int, default=MIN_CRY_DURATION,
+    parser.add_argument('--min-cry', type=bounded_int(*MIN_CRY_RANGE), default=MIN_CRY_DURATION,
                         help=f'Seconds of sustained crying before announcing episode (default: {MIN_CRY_DURATION})')
-    parser.add_argument('--silence-gap', type=int, default=SILENCE_GAP,
+    parser.add_argument('--silence-gap', type=bounded_int(*SILENCE_GAP_RANGE), default=SILENCE_GAP,
                         help=f'Seconds of silence within crying that resets detection (default: {SILENCE_GAP})')
     parser.add_argument('--healthcheck', type=str, default=None,
                         help='Healthchecks.io ping URL for heartbeat monitoring')
-    parser.add_argument('--heartbeat', type=int, default=5,
+    parser.add_argument('--heartbeat', type=bounded_int(*HEARTBEAT_MINUTES_RANGE), default=5,
                         help='Heartbeat interval in minutes (default: 5)')
     parser.add_argument('--stop-at', type=str, default=None,
                         help='Time to auto-stop the script (HH:MM format, e.g. 07:00)')
-    parser.add_argument('--status-port', type=int, default=None,
+    parser.add_argument('--status-port', type=bounded_int(*STATUS_PORT_RANGE), default=None,
                         help=f'Enable HTTP status server on this port (default: disabled, use {DEFAULT_STATUS_PORT})')
+    parser.add_argument('--status-bind', type=str, default=DEFAULT_STATUS_BIND,
+                        help=f'Address for the status server (default: {DEFAULT_STATUS_BIND}; '
+                             'use 0.0.0.0 to allow other machines, e.g. receiver.py)')
     args = parser.parse_args()
+
+    def _handle_sigterm(signum, frame):
+        """Web UI STOP and `systemctl stop` send SIGTERM; reuse the Ctrl+C path so
+        an in-progress recording is saved and audio/HTTP resources are released."""
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     detector = CryDetector()
     detector.volume_threshold = args.volume
     detector.cry_freq_min = args.cry_freq_min
     detector.cry_ratio_threshold = args.ratio
     detector.enable_recording = args.record
-    detector.enable_pushover = args.pushover and PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN
+    detector.enable_pushover = bool(args.pushover and PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN)
     detector.pushover_device = args.pushover_device
     detector.alert_window = args.alert * 60  # Convert minutes to seconds
     detector.reset_window = args.reset * 60
@@ -699,12 +850,13 @@ if __name__ == "__main__":
     if args.status_port:
         detector.enable_status_server = True
         detector.status_port = args.status_port
+        detector.status_bind = args.status_bind
     if args.stop_at:
         try:
             h, m = args.stop_at.split(':')
             detector.stop_time = datetime.strptime(f"{h}:{m}", "%H:%M").time()
         except ValueError:
             print(f"Invalid --stop-at format: '{args.stop_at}'. Use HH:MM (e.g. 07:00)")
-            exit(1)
+            sys.exit(1)
     detector.start()
     detector.monitor()

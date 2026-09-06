@@ -19,6 +19,12 @@ def _signal_acknowledge(signum, frame):
     if _receiver_instance is not None:
         _receiver_instance.acknowledge_alarm()
 
+
+def _signal_terminate(signum, frame):
+    """Handle SIGTERM (launcher stop, systemctl stop) via the Ctrl+C cleanup path
+    so the LEDs, display and buzzer are released."""
+    raise KeyboardInterrupt
+
 # Try to import Rainbow HAT (will fail if not on Pi with HAT)
 try:
     import rainbowhat
@@ -62,6 +68,7 @@ class BabyMonitorReceiver:
         global _receiver_instance
         _receiver_instance = self
         signal.signal(signal.SIGUSR1, _signal_acknowledge)
+        signal.signal(signal.SIGTERM, _signal_terminate)
 
         # Initialize gpiozero buzzer (skip if no_gpio mode)
         self.buzzer = None
@@ -130,7 +137,7 @@ class BabyMonitorReceiver:
             self.connection_errors = 0  # Reset on successful connection
             self.error_acknowledged = False  # Reset error acknowledgment
             return data
-        except Exception as e:
+        except Exception:
             self.connection_errors += 1
             return None
 

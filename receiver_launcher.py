@@ -273,8 +273,15 @@ def update_leds():
     update_display(status)
 
 
+def _handle_sigterm(signum, frame):
+    """Route SIGTERM (systemctl stop) through the Ctrl+C path so the receiver child
+    is stopped and the LEDs/buzzer are released instead of being orphaned."""
+    raise KeyboardInterrupt
+
+
 def main():
     global receiver_process
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     print("Baby Monitor Launcher started")
     print("Touch A to start/stop receiver")
     print("Touch B or C to acknowledge alarm")

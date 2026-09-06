@@ -9,10 +9,11 @@ import signal
 import sys
 import time
 import json
+import hmac
 import threading
 from datetime import datetime
 from collections import deque
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, Response
 
 app = Flask(__name__)
 
@@ -28,9 +29,24 @@ try:
 except ImportError:
     HEALTHCHECK_API_KEY = None
 
+# Optional HTTP basic auth. Off unless config.py defines WEB_PASSWORD, so nobody
+# gets locked out of the monitor at 2am by an upgrade.
+try:
+    from config import WEB_PASSWORD
+except ImportError:
+    WEB_PASSWORD = None
+
+try:
+    from config import WEB_USERNAME
+except ImportError:
+    WEB_USERNAME = 'baby'
+
 # Log file settings
 LOG_DIR = "/var/log/babymonitor"
 LOG_FILE = None  # Will be set when detector starts
+# The per-run detector log is moved to USB on stop, so config changes made while
+# stopped had nowhere to go. This log belongs to the controller and always exists.
+CONTROLLER_LOG = "controller.log"
 
 # Configuration defaults
 DEFAULT_CONFIG = {
@@ -50,16 +66,133 @@ DEFAULT_CONFIG = {
     'heartbeat': 5,         # minutes
 }
 
+# Allowed range for each numeric setting, as (minimum, maximum).
+# Zero or negative values break detection - alert=0 fires an alert on every audio
+# chunk, min_cry=0 makes every cough an episode - so incoming values are clamped
+# instead of trusted.
+CONFIG_LIMITS = {
+    'volume': (50, 30000),
+    'cry_freq_min': (100, 1900),  # must stay under the detector's 2000 Hz ceiling
+    'alert': (1, 240),            # minutes
+    'reset': (1, 240),            # minutes
+    'min_cry': (1, 300),          # seconds
+    'silence_gap': (1, 120),      # seconds
+    'heartbeat': (1, 60),         # minutes
+    'status_port': (1024, 65535),
+}
+
+# Persisted settings, so a reboot or service restart keeps the last config
+CONFIG_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monitor_config.json')
+
 # State
 detector_process = None
+stopping_pids = set()  # pids the web UI is deliberately stopping, so the process
+                       # monitor doesn't mistake a requested stop for a crash
+last_failure = None    # last unexpected detector exit, shown as a banner on every
+                       # phone until dismissed or a new detector is started
+running_status_port = None  # status port the live detector was launched with; not
+                            # cleared on exit because every use is behind is_running()
 current_config = DEFAULT_CONFIG.copy()
+config_lock = threading.Lock()
+_last_saved_config = None  # last snapshot written to disk, to skip no-op saves
 log_buffer = deque(maxlen=100)  # Keep last 100 log lines
 event_log_buffer = deque(maxlen=300)  # Key events only
 log_lock = threading.Lock()
 
 # Patterns that indicate key events worth showing in the event log
 EVENT_PATTERNS = ['Baby started crying', 'Ignored brief sound', 'ALERT', 'Baby settled',
-                  'MICROPHONE SILENT', 'Microphone recovered', 'Heartbeat FAIL', 'Heartbeat failed']
+                  'MICROPHONE SILENT', 'Microphone recovered', 'Heartbeat FAIL', 'Heartbeat failed',
+                  'Audio stream error', 'Audio stream recovered', 'Reconnection failed']
+
+
+def sanitize_config_value(key, value):
+    """Coerce and clamp one setting to something the detector can actually use.
+
+    Returns (accepted, value). Unknown keys are rejected.
+    """
+    if key not in DEFAULT_CONFIG:
+        return False, None
+    default = DEFAULT_CONFIG[key]
+    # bool is checked first because bool is a subclass of int
+    if isinstance(default, bool):
+        return (True, value) if isinstance(value, bool) else (False, None)
+    if key in CONFIG_LIMITS:
+        if isinstance(value, bool):
+            return False, None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return False, None
+        low, high = CONFIG_LIMITS[key]
+        return True, max(low, min(high, number))
+    if key == 'pushover_device':
+        # isinstance first: `value in DEVICE_LABELS` raises TypeError on a list/dict
+        return (True, value) if isinstance(value, str) and value in DEVICE_LABELS else (False, None)
+    if key == 'stop_at':
+        # A malformed time makes the detector exit(1) at startup, so normalise
+        # it here (07:00) or reject it outright
+        try:
+            return True, datetime.strptime(value, '%H:%M').strftime('%H:%M')
+        except (TypeError, ValueError):
+            return False, None
+    if isinstance(default, str):
+        return (True, value) if isinstance(value, str) else (False, None)
+    return True, value
+
+
+def sanitize_config(patch):
+    """Filter a dict of settings down to accepted, clamped values.
+
+    Returns (clean, rejected) where rejected lists keys that were dropped.
+    """
+    if not isinstance(patch, dict):
+        return {}, []
+    clean, rejected = {}, []
+    for key, value in patch.items():
+        accepted, cleaned = sanitize_config_value(key, value)
+        if accepted:
+            clean[key] = cleaned
+        else:
+            rejected.append(key)
+    return clean, rejected
+
+
+def load_config():
+    """Load persisted settings over the defaults, ignoring unknown or bad values."""
+    if not os.path.exists(CONFIG_STATE_FILE):
+        return
+    try:
+        with open(CONFIG_STATE_FILE) as f:
+            saved = json.load(f)
+    except Exception as e:
+        print(f"Warning: could not read {CONFIG_STATE_FILE}: {e}")
+        return
+    if not isinstance(saved, dict):
+        return
+    global _last_saved_config
+    clean, rejected = sanitize_config(saved)
+    current_config.update(clean)
+    _last_saved_config = dict(current_config)
+    if rejected:
+        print(f"Warning: ignored bad saved settings: {', '.join(sorted(rejected))}")
+    print(f"Loaded saved config from {CONFIG_STATE_FILE}")
+
+
+def save_config():
+    """Persist the current settings atomically so a restart picks them back up."""
+    global _last_saved_config
+    try:
+        with config_lock:
+            snapshot = dict(current_config)
+            if snapshot == _last_saved_config:
+                return  # nothing actually changed; skip the SD-card write
+            tmp_path = CONFIG_STATE_FILE + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump(snapshot, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, CONFIG_STATE_FILE)
+            _last_saved_config = snapshot
+    except Exception as e:
+        print(f"Warning: could not save config to {CONFIG_STATE_FILE}: {e}")
 
 # ANSI color code stripping
 import re
@@ -67,6 +200,15 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 def strip_ansi(text):
     return ANSI_ESCAPE.sub('', text)
+
+# The only accepted Pushover device values, in the order their buttons appear.
+# Also the whitelist: anything else is rejected rather than forwarded to Pushover.
+DEVICE_LABELS = {
+    'h_phone': 'mama',
+    'a_phone': 'papa',
+    'grandma_phone': 'grandma',
+    '__muted__': 'mute',
+}
 
 # Human-readable labels and units for config keys, used in event-log messages
 CONFIG_LABELS = {
@@ -92,12 +234,35 @@ def describe_config_change(key, old_value, new_value):
         return f"Config: {label} {'ENABLED' if new_value else 'DISABLED'}"
     return f"Config: {label} changed {old_value}{unit} -> {new_value}{unit}"
 
+def detector_endpoint(path):
+    """Build a URL for the running detector's HTTP server.
+
+    Deliberately uses the port the process was launched with rather than the current
+    setting: the detector binds its port once at startup, so editing status_port while
+    it runs would point the controller at a dead port - status polling would go blank
+    and live updates (including a duty switch) would be silently dropped until restart.
+    """
+    port = running_status_port if running_status_port is not None else current_config['status_port']
+    return f"http://localhost:{port}{path}"
+
+
+def write_controller_log(line):
+    """Append to the controller's own log. Never raises: logging must not break the UI."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(os.path.join(LOG_DIR, CONTROLLER_LOG), 'a') as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
 def log_event(message):
-    """Record a key event (e.g. config change) to the log buffers and file."""
+    """Record a key event (e.g. config change) to the log buffers and files."""
     log_line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
     with log_lock:
         log_buffer.append(log_line)
         event_log_buffer.append(log_line)
+    write_controller_log(log_line)
     if LOG_FILE and os.path.exists(LOG_FILE):
         try:
             with open(LOG_FILE, 'a') as f:
@@ -129,26 +294,85 @@ def log_reader(process, log_file_path):
             log_buffer.append(f"[ERROR] Log reader: {e}")
 
 def process_monitor(process):
-    """Monitor detector process and pause healthcheck if it exits on its own (e.g. auto-stop)."""
+    """React when the detector exits on its own.
+
+    A stop requested from the web UI is handled by stop_detector(), so this only
+    fires for self-exits: a clean auto-stop, or a crash / startup failure.
+    Pausing the healthcheck is reserved for clean exits - pausing after a crash
+    would silence the one alert that says nobody is watching the baby.
+    """
     global detector_process
     process.wait()  # Block until process exits
-    # Only act if this process is still the current one (not already stopped via web UI)
-    if detector_process is not None and detector_process.pid == process.pid:
-        detector_process = None
+
+    if process.pid in stopping_pids:
+        stopping_pids.discard(process.pid)
+        return
+    # Ignore a stale process that is no longer the current one
+    if detector_process is None or detector_process.pid != process.pid:
+        return
+
+    detector_process = None
+    returncode = process.returncode
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if returncode == 0:
+        # Clean shutdown, i.e. the --stop-at time was reached
         hc_paused = pause_healthcheck()
-        msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Detector exited (auto-stop)"
+        msg = f"[{timestamp}] Detector exited normally (auto-stop)"
         if hc_paused:
             msg += " (healthcheck paused)"
-        with log_lock:
-            log_buffer.append(msg)
-            event_log_buffer.append(msg)
-        if LOG_FILE and os.path.exists(LOG_FILE):
+        extra = None
+    else:
+        # Crash, bad argument, or an outside kill: leave monitoring armed and
+        # escalate now rather than pausing the check
+        hc_failed = fail_healthcheck()
+        reason = (f"killed by signal {-returncode}" if returncode < 0
+                  else f"exit code {returncode}")
+        msg = f"[{timestamp}] Detector exited UNEXPECTEDLY ({reason}) - NOT monitoring"
+        if hc_failed:
+            msg += " (healthcheck FAIL sent)"
+        elif current_config.get('enable_healthcheck'):
+            msg += " (healthcheck FAIL could not be sent)"
+        extra = None
+
+    last_output = None
+    with log_lock:
+        if returncode != 0:
+            # Surface the detector's last words; usually the actual cause
+            last_output = next((l for l in reversed(log_buffer) if l.strip()), None)
+            if last_output:
+                extra = f"[{timestamp}] Last detector output: {last_output}"
+        log_buffer.append(msg)
+        event_log_buffer.append(msg)
+        if extra:
+            log_buffer.append(extra)
+            event_log_buffer.append(extra)
+
+    write_controller_log(msg)
+    if extra:
+        write_controller_log(extra)
+
+    if returncode != 0:
+        global last_failure
+        last_failure = {
+            'time': timestamp,
+            'reason': reason,
+            'detail': last_output or '',
+            'escalated': bool(hc_failed),
+        }
+
+    if LOG_FILE and os.path.exists(LOG_FILE):
+        try:
             with open(LOG_FILE, 'a') as f:
                 f.write(msg + "\n")
+                if extra:
+                    f.write(extra + "\n")
+        except Exception:
+            pass
 
 def start_detector():
     """Start the cry detector process"""
-    global detector_process, log_buffer, LOG_FILE
+    global detector_process, log_buffer, LOG_FILE, last_failure, running_status_port
 
     if detector_process is not None and detector_process.poll() is None:
         return False, "Detector is already running"
@@ -189,16 +413,24 @@ def start_detector():
 
     # Clear log buffer and write initial log entry
     start_msg = f"Starting: {' '.join(cmd)}"
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with log_lock:
-        log_buffer.clear()
-        event_log_buffer.clear()
-        log_buffer.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {start_msg}")
+        log_buffer.clear()  # verbose per-run output
+        # The event log is deliberately kept: settings changed before START, and
+        # last night's alerts, stay visible. It self-trims at maxlen.
+        event_log_buffer.append(f"[{timestamp}] --- Detector started ---")
+        log_buffer.append(f"[{timestamp}] {start_msg}")
+    write_controller_log(f"[{timestamp}] {start_msg}")
 
     # Write to log file
     with open(LOG_FILE, 'w') as f:
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {start_msg}\n")
 
     try:
+        # Pin the port before the process exists, so no status poll can slip in
+        # between launch and pinning and read a stale port
+        running_status_port = current_config['status_port']
+
         detector_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -214,6 +446,9 @@ def start_detector():
         # Start process monitor thread (detects auto-stop and pauses healthcheck)
         monitor_thread = threading.Thread(target=process_monitor, args=(detector_process,), daemon=True)
         monitor_thread.start()
+
+        # A fresh start clears the previous crash banner
+        last_failure = None
 
         return True, f"Detector started (log: {LOG_FILE})"
     except Exception as e:
@@ -257,6 +492,24 @@ def pause_healthcheck():
             log_buffer.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Healthcheck pause failed: {e}")
         return False
 
+def fail_healthcheck():
+    """Send a /fail ping so an unexpected detector exit escalates immediately
+    instead of waiting for the healthchecks.io period to expire.
+
+    Only needs the ping URL, not the management API key.
+    """
+    if not current_config.get('enable_healthcheck') or not HEALTHCHECK_URL:
+        return False
+    try:
+        import urllib.request
+        urllib.request.urlopen(HEALTHCHECK_URL.rstrip('/') + '/fail', timeout=5)
+        print("Healthcheck FAIL sent (detector exited unexpectedly)")
+        return True
+    except Exception as e:
+        print(f"Failed to send healthcheck FAIL: {e}")
+        return False
+
+
 def stop_detector():
     """Stop the cry detector process"""
     global detector_process
@@ -265,17 +518,46 @@ def stop_detector():
         detector_process = None
         return False, "Detector is not running"
 
+    process = detector_process
+    # Flag it before signalling so the process monitor doesn't read this as a crash
+    stopping_pids.add(process.pid)
+    forced = False
+
     try:
-        os.killpg(os.getpgid(detector_process.pid), signal.SIGTERM)
-        detector_process.wait(timeout=5)
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # exited between the poll above and now
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Wedged detector: escalate so STOP always works from the phone
+            forced = True
+            print("Detector ignored SIGTERM after 5s; sending SIGKILL")
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # unkillable; clear our state anyway so the UI isn't stuck
+    except Exception as e:
+        stopping_pids.discard(process.pid)
+        return False, f"Failed to stop: {e}"
+
+    try:
         detector_process = None
 
         # Pause healthcheck to avoid false alerts
         hc_paused = pause_healthcheck()
 
         stop_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Detector stopped"
+        if forced:
+            stop_msg += " (forced with SIGKILL; any in-progress recording was lost)"
         if hc_paused:
             stop_msg += " (healthcheck paused)"
+        write_controller_log(stop_msg)
         with log_lock:
             log_buffer.append(stop_msg)
         # Write to log file
@@ -292,7 +574,7 @@ def stop_detector():
                 print(f"Log moved to {usb_log_dir}/{os.path.basename(LOG_FILE)}")
             except Exception as e:
                 print(f"Failed to move log to USB: {e}")
-        return True, "Detector stopped"
+        return True, "Detector stopped (forced)" if forced else "Detector stopped"
     except Exception as e:
         return False, f"Failed to stop: {e}"
 
@@ -336,6 +618,38 @@ HTML_TEMPLATE = """
         .status-crying { background: #e74c3c; animation: pulse 1s infinite; }
         .status-alarm { background: #c0392b; animation: pulse 0.5s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+        .failure-banner {
+            background: #c0392b;
+            color: #fff;
+            border: 1px solid #e74c3c;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 16px;
+            font-size: 15px;
+            font-weight: bold;
+            line-height: 1.4;
+        }
+        .failure-detail {
+            font-family: monospace;
+            font-size: 12px;
+            font-weight: normal;
+            opacity: 0.9;
+            margin-top: 8px;
+            word-wrap: break-word;
+        }
+        .btn-dismiss {
+            margin-top: 12px;
+            padding: 8px 14px;
+            border: 1px solid rgba(255, 255, 255, 0.6);
+            border-radius: 8px;
+            background: transparent;
+            color: #fff;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-dismiss:active { background: rgba(255, 255, 255, 0.15); }
 
         .card {
             background: #16213e;
@@ -484,6 +798,12 @@ HTML_TEMPLATE = """
         <span id="status-badge" class="status-badge status-stopped">STOPPED</span>
     </div>
 
+    <div id="failure-banner" class="failure-banner" style="display: none;">
+        <div id="failure-text"></div>
+        <div id="failure-detail" class="failure-detail"></div>
+        <button class="btn-dismiss" onclick="dismissFailure()">Dismiss</button>
+    </div>
+
     <div id="baby-status" class="card baby-status" style="display: none;">
         <div id="baby-emoji"></div>
         <div id="episode-duration" class="episode-duration"></div>
@@ -498,16 +818,15 @@ HTML_TEMPLATE = """
 
     <div style="text-align: center; color: #aaa; font-size: 14px; margin-bottom: 8px;">Who is on duty?</div>
     <div class="device-row">
-        <button id="btn-h" class="btn-device {{ 'selected' if config.pushover_device == 'h_phone' else '' }}" onclick="selectDevice('h_phone')">mama</button>
-        <button id="btn-a" class="btn-device {{ 'selected' if config.pushover_device == 'a_phone' else '' }}" onclick="selectDevice('a_phone')">papa</button>
-        <button id="btn-g" class="btn-device {{ 'selected' if config.pushover_device == 'grandma_phone' else '' }}" onclick="selectDevice('grandma_phone')">grandma</button>
-        <button id="btn-mute" class="btn-device {{ 'selected' if config.pushover_device == '__muted__' else '' }}" onclick="selectDevice('__muted__')">mute</button>
+        {% for key, label in devices %}
+        <button id="btn-{{ key }}" class="btn-device {{ 'selected' if config.pushover_device == key else '' }}" onclick="selectDevice('{{ key }}')">{{ label }}</button>
+        {% endfor %}
     </div>
-    <div class="restart-note">Alerts go to selected device. Switches instantly when running.</div>
+    <div class="restart-note">Alerts go to selected device. Switches instantly, running or stopped.</div>
 
     <div class="card">
         <h2>Configuration</h2>
-        <div class="restart-note">Changes apply instantly when running.</div>
+        <div class="restart-note">Changes save immediately, running or stopped, and apply instantly when running.</div>
         <div class="row">
             <div class="form-group">
                 <label>Alert (min)</label>
@@ -563,7 +882,18 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <div class="restart-note">Stop At, Healthcheck, and Recording require restart.</div>
+        <div class="row">
+            <div class="form-group">
+                <label>Heartbeat (min)</label>
+                <div class="stepper">
+                    <button type="button" class="stepper-btn" onclick="stepValue('heartbeat', -1)">-</button>
+                    <input type="number" id="heartbeat" value="{{ config.heartbeat }}">
+                    <button type="button" class="stepper-btn" onclick="stepValue('heartbeat', 1)">+</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="restart-note">Stop At, Healthcheck, Recording and Heartbeat are saved now but only take effect on next start/restart.</div>
         <div class="form-group inline-option">
             <input type="checkbox" id="enable_stop_at" {{ 'checked' if config.enable_stop_at else '' }}>
             <label for="enable_stop_at" style="margin: 0; white-space: nowrap;">Stop At</label>
@@ -605,45 +935,126 @@ HTML_TEMPLATE = """
 
     <script>
         let isRunning = false;
-        let statusInterval = null;
         let selectedDevice = '{{ config.pushover_device }}';
+        let devicePending = 0;  // in-flight /api/device posts; poll must not clobber them
+        let dismissPending = 0;  // in-flight dismiss; poll must not bring the banner back
+        let configPending = 0;  // in-flight /api/config posts; poll must not clobber them
+
+        const NUMBER_FIELDS = ['volume', 'cry_freq_min', 'alert', 'reset', 'min_cry',
+                               'silence_gap', 'heartbeat'];
+        const CHECK_FIELDS = ['enable_stop_at', 'enable_healthcheck', 'record'];
+        // Same [min, max] the server enforces, injected so the two can't drift apart
+        const FIELD_LIMITS = {{ config_limits|tojson }};
+        // Accepted device values, from the server's whitelist
+        const DEVICES = {{ device_keys|tojson }};
+
+        function highlightDevice(device) {
+            for (const key of DEVICES) {
+                document.getElementById('btn-' + key).classList.toggle('selected', key === device);
+            }
+        }
+
+        function clampField(id, value) {
+            const limit = FIELD_LIMITS[id];
+            if (!limit) return value;
+            return Math.max(limit[0], Math.min(limit[1], value));
+        }
+
+        // Save a config change on the server whether running or stopped: a running
+        // detector picks up the live-tunable ones immediately, a stopped one uses
+        // them all on next start.
+        async function postConfig(patch) {
+            configPending++;
+            try {
+                await fetch('/api/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(patch)
+                });
+            } catch (e) {
+                console.error('Failed to update config:', e);
+            } finally {
+                configPending--;
+            }
+        }
 
         async function stepValue(id, delta) {
             const input = document.getElementById(id);
             let val = parseInt(input.value) || 0;
-            val = Math.max(0, val + delta);
+            val = clampField(id, val + delta);
             input.value = val;
-            if (isRunning) {
-                try {
-                    await fetch('/api/config', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({[id]: val})
-                    });
-                } catch (e) {
-                    console.error('Failed to update config:', e);
-                }
+            await postConfig({[id]: val});
+        }
+
+        // Typed-in numbers, the stop-at time, and the checkboxes save on change too
+        function wireConfigInputs() {
+            for (const id of NUMBER_FIELDS) {
+                const el = document.getElementById(id);
+                if (!el) continue;  // listed but not rendered; don't kill the page script
+                el.addEventListener('change', (e) => {
+                    const val = clampField(id, parseInt(e.target.value) || 0);
+                    e.target.value = val;
+                    postConfig({[id]: val});
+                });
             }
+            for (const id of CHECK_FIELDS) {
+                const el = document.getElementById(id);
+                if (!el) continue;
+                el.addEventListener('change', (e) => {
+                    postConfig({[id]: e.target.checked});
+                });
+            }
+            document.getElementById('stop_at').addEventListener('change', (e) => {
+                postConfig({stop_at: e.target.value});
+            });
         }
 
         async function selectDevice(device) {
             selectedDevice = device;
-            document.getElementById('btn-h').classList.toggle('selected', device === 'h_phone');
-            document.getElementById('btn-a').classList.toggle('selected', device === 'a_phone');
-            document.getElementById('btn-g').classList.toggle('selected', device === 'grandma_phone');
-            document.getElementById('btn-mute').classList.toggle('selected', device === '__muted__');
+            highlightDevice(device);
 
-            // If running, update the device immediately
-            if (isRunning) {
-                try {
-                    await fetch('/api/device', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({pushover_device: device})
-                    });
-                } catch (e) {
-                    console.error('Failed to update device:', e);
-                }
+            // Persist on the server whether running or stopped: a running detector is
+            // updated live, a stopped one uses it on next start.
+            devicePending++;
+            try {
+                await fetch('/api/device', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({pushover_device: device})
+                });
+            } catch (e) {
+                console.error('Failed to update device:', e);
+            } finally {
+                devicePending--;
+            }
+        }
+
+        function updateFailureBanner(failure) {
+            if (dismissPending > 0) return;  // a dismiss is in flight
+            const banner = document.getElementById('failure-banner');
+            if (!failure) {
+                banner.style.display = 'none';
+                return;
+            }
+            let text = '\u26A0 Detector stopped unexpectedly at ' + failure.time
+                     + ' (' + failure.reason + ') - not monitoring.';
+            if (failure.escalated) {
+                text += ' Healthcheck alert sent.';
+            }
+            document.getElementById('failure-text').textContent = text;
+            document.getElementById('failure-detail').textContent = failure.detail || '';
+            banner.style.display = 'block';
+        }
+
+        async function dismissFailure() {
+            document.getElementById('failure-banner').style.display = 'none';
+            dismissPending++;
+            try {
+                await fetch('/api/dismiss-failure', {method: 'POST'});
+            } catch (e) {
+                console.error('Failed to dismiss banner:', e);
+            } finally {
+                dismissPending--;
             }
         }
 
@@ -673,7 +1084,20 @@ HTML_TEMPLATE = """
 
             if (running && babyStatus) {
                 babyDiv.style.display = 'block';
-                if (babyStatus.mic_silent) {
+                // Stream down (or no chunk for 30s) means the detector is not listening
+                // at all - never let that render as "all quiet"
+                const audioDown = babyStatus.stream_ok === false ||
+                    (babyStatus.seconds_since_audio != null && babyStatus.seconds_since_audio > 30);
+                if (audioDown) {
+                    badge.className = 'status-badge status-alarm';
+                    badge.textContent = 'NO AUDIO';
+                    babyEmoji.textContent = '🔌';
+                    durationDiv.textContent = 'Not listening - audio stream down!';
+                    extraInfo.textContent = babyStatus.seconds_since_audio != null
+                        ? 'No audio for ' + formatDuration(babyStatus.seconds_since_audio)
+                        : 'Check the USB microphone';
+                    extraInfo.style.color = '#e74c3c';
+                } else if (babyStatus.mic_silent) {
                     badge.className = 'status-badge status-alarm';
                     badge.textContent = 'MIC SILENT';
                     babyEmoji.textContent = '🎤';
@@ -798,32 +1222,31 @@ HTML_TEMPLATE = """
 
         function syncConfigUI(config) {
             if (!config) return;
-            // Update number/text fields, but never clobber a field the user is editing
-            const fields = ['volume', 'cry_freq_min', 'alert', 'reset', 'min_cry',
-                            'silence_gap', 'stop_at'];
-            for (const id of fields) {
-                const el = document.getElementById(id);
-                if (el && document.activeElement !== el && config[id] !== undefined
-                    && String(el.value) !== String(config[id])) {
-                    el.value = config[id];
+            // Skip while our own change is in flight, or the stale poll response
+            // would snap the field back to the pre-change value.
+            if (configPending === 0) {
+                // Update number/text fields, but never clobber a field the user is editing
+                for (const id of NUMBER_FIELDS.concat(['stop_at'])) {
+                    const el = document.getElementById(id);
+                    if (el && document.activeElement !== el && config[id] !== undefined
+                        && String(el.value) !== String(config[id])) {
+                        el.value = config[id];
+                    }
                 }
-            }
-            // Update checkboxes
-            const checks = ['enable_stop_at', 'enable_healthcheck', 'record'];
-            for (const id of checks) {
-                const el = document.getElementById(id);
-                if (el && document.activeElement !== el && config[id] !== undefined
-                    && el.checked !== config[id]) {
-                    el.checked = config[id];
+                // Update checkboxes
+                for (const id of CHECK_FIELDS) {
+                    const el = document.getElementById(id);
+                    if (el && document.activeElement !== el && config[id] !== undefined
+                        && el.checked !== config[id]) {
+                        el.checked = config[id];
+                    }
                 }
             }
             // Update device selection
-            if (config.pushover_device !== undefined && config.pushover_device !== selectedDevice) {
+            if (devicePending === 0 && config.pushover_device !== undefined
+                && config.pushover_device !== selectedDevice) {
                 selectedDevice = config.pushover_device;
-                document.getElementById('btn-h').classList.toggle('selected', selectedDevice === 'h_phone');
-                document.getElementById('btn-a').classList.toggle('selected', selectedDevice === 'a_phone');
-                document.getElementById('btn-g').classList.toggle('selected', selectedDevice === 'grandma_phone');
-                document.getElementById('btn-mute').classList.toggle('selected', selectedDevice === '__muted__');
+                highlightDevice(selectedDevice);
             }
         }
 
@@ -832,6 +1255,7 @@ HTML_TEMPLATE = """
                 const resp = await fetch('/api/status');
                 const data = await resp.json();
                 updateUI(data.running, data.baby_status);
+                updateFailureBanner(data.failure);
                 syncConfigUI(data.config);
 
                 const eventsDiv = document.getElementById('events');
@@ -853,6 +1277,7 @@ HTML_TEMPLATE = """
         }
 
         // Refresh every 2 seconds
+        wireConfigInputs();
         setInterval(refreshStatus, 2000);
         refreshStatus();
     </script>
@@ -860,9 +1285,34 @@ HTML_TEMPLATE = """
 </html>
 """
 
+load_config()
+
+
+@app.before_request
+def require_auth():
+    """Enforce basic auth only when config.py sets WEB_PASSWORD.
+
+    The web UI and the detector's status port are otherwise open to anyone on the
+    WiFi, who could mute alerts or retune detection.
+    """
+    if not WEB_PASSWORD:
+        return None
+    auth = request.authorization
+    if auth and auth.password is not None:
+        user_ok = hmac.compare_digest(str(auth.username or '').encode(), WEB_USERNAME.encode())
+        pass_ok = hmac.compare_digest(auth.password.encode(), WEB_PASSWORD.encode())
+        if user_ok and pass_ok:
+            return None
+    return Response('Authentication required', 401,
+                    {'WWW-Authenticate': 'Basic realm="Baby Monitor"'})
+
+
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, config=current_config)
+    return render_template_string(HTML_TEMPLATE, config=current_config,
+                                  config_limits=CONFIG_LIMITS,
+                                  devices=list(DEVICE_LABELS.items()),
+                                  device_keys=list(DEVICE_LABELS))
 
 @app.route('/api/status')
 def api_status():
@@ -874,7 +1324,7 @@ def api_status():
     if running:
         try:
             import urllib.request
-            url = f"http://localhost:{current_config['status_port']}/status"
+            url = detector_endpoint('/status')
             response = urllib.request.urlopen(url, timeout=2)
             baby_status = json.loads(response.read().decode())
         except Exception:
@@ -889,23 +1339,25 @@ def api_status():
         'baby_status': baby_status,
         'events': events,
         'logs': logs,
-        'config': current_config
+        'config': current_config,
+        'failure': last_failure
     })
 
 @app.route('/api/device', methods=['POST'])
 def api_device():
-    """Change pushover device on running detector"""
+    """Change pushover device. Works whether or not the detector is running:
+    a running detector is updated live, a stopped one picks it up on next start."""
     global current_config
-
-    if not is_running():
-        return jsonify({'success': False, 'message': 'Detector not running'})
 
     if request.json and 'pushover_device' in request.json:
         device = request.json['pushover_device']
+        if not isinstance(device, str) or device not in DEVICE_LABELS:
+            return jsonify({'success': False,
+                            'message': f"Unknown device '{device}'",
+                            'device': current_config['pushover_device']}), 400
+
         old_device = current_config['pushover_device']
         if device != old_device:
-            DEVICE_LABELS = {'h_phone': 'mama', 'a_phone': 'papa',
-                             'grandma_phone': 'grandma', '__muted__': 'muted'}
             if device == '__muted__':
                 log_event("Config: Pushover alerts MUTED")
             elif old_device == '__muted__':
@@ -914,20 +1366,30 @@ def api_device():
                 log_event(f"Config: Pushover device changed "
                           f"{DEVICE_LABELS.get(old_device, old_device)} -> {DEVICE_LABELS.get(device, device)}")
         current_config['pushover_device'] = device
+        save_config()
 
-        # Forward to detector's config endpoint
-        try:
-            import urllib.request
-            url = f"http://localhost:{current_config['status_port']}/config"
-            data = json.dumps({'pushover_device': device}).encode('utf-8')
-            req = urllib.request.Request(url, data=data, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            urllib.request.urlopen(req, timeout=2)
-            return jsonify({'success': True, 'device': device})
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)})
+        # Forward to detector's config endpoint (only meaningful while running)
+        if is_running():
+            try:
+                import urllib.request
+                url = detector_endpoint('/config')
+                data = json.dumps({'pushover_device': device}).encode('utf-8')
+                req = urllib.request.Request(url, data=data, method='POST')
+                req.add_header('Content-Type', 'application/json')
+                urllib.request.urlopen(req, timeout=2)
+            except Exception as e:
+                return jsonify({'success': False, 'message': str(e), 'device': device})
+
+        return jsonify({'success': True, 'device': device})
 
     return jsonify({'success': False, 'message': 'No device specified'})
+
+@app.route('/api/dismiss-failure', methods=['POST'])
+def api_dismiss_failure():
+    """Clear the crash banner. Shared state, so it clears on every phone."""
+    global last_failure
+    last_failure = None
+    return jsonify({'success': True})
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
@@ -935,9 +1397,13 @@ def api_start():
     global current_config
 
     if request.json:
-        for key in request.json:
-            if key in current_config:
-                current_config[key] = request.json[key]
+        if not isinstance(request.json, dict):
+            return jsonify({'success': False, 'message': 'Expected a JSON object'}), 400
+        clean, rejected = sanitize_config(request.json)
+        if rejected:
+            print(f"Ignored invalid settings on start: {', '.join(sorted(rejected))}")
+        current_config.update(clean)
+        save_config()
 
     success, message = start_detector()
     return jsonify({'success': success, 'message': message})
@@ -954,33 +1420,42 @@ def api_config():
     global current_config
 
     if request.method == 'POST' and request.json:
-        for key in request.json:
-            if key in current_config:
-                old_value = current_config[key]
-                new_value = request.json[key]
-                if old_value != new_value:
-                    log_event(describe_config_change(key, old_value, new_value))
-                current_config[key] = new_value
+        if not isinstance(request.json, dict):
+            return jsonify({'error': 'Expected a JSON object'}), 400
+        clean, rejected = sanitize_config(request.json)
+        if rejected:
+            print(f"Ignored invalid settings: {', '.join(sorted(rejected))}")
+        for key, new_value in clean.items():
+            old_value = current_config[key]
+            if old_value != new_value:
+                log_event(describe_config_change(key, old_value, new_value))
+            current_config[key] = new_value
+        save_config()
+
+        if ('status_port' in clean and is_running()
+                and clean['status_port'] != running_status_port):
+            log_event(f"Config: Status port takes effect on next start "
+                      f"(detector still using {running_status_port})")
 
         # Forward to running detector if applicable
         if is_running():
             detector_config = {}
             mapping = {
-                'volume': ('volume_threshold', lambda v: int(v)),
-                'cry_freq_min': ('cry_freq_min', lambda v: int(v)),
-                'alert': ('alert_window', lambda v: int(v) * 60),
-                'reset': ('reset_window', lambda v: int(v) * 60),
-                'min_cry': ('min_cry_duration', lambda v: int(v)),
-                'silence_gap': ('silence_gap', lambda v: int(v)),
+                'volume': ('volume_threshold', lambda v: v),
+                'cry_freq_min': ('cry_freq_min', lambda v: v),
+                'alert': ('alert_window', lambda v: v * 60),
+                'reset': ('reset_window', lambda v: v * 60),
+                'min_cry': ('min_cry_duration', lambda v: v),
+                'silence_gap': ('silence_gap', lambda v: v),
             }
             for key, (attr, convert) in mapping.items():
-                if key in request.json:
-                    detector_config[attr] = convert(request.json[key])
+                if key in clean:
+                    detector_config[attr] = convert(clean[key])
 
             if detector_config:
                 try:
                     import urllib.request
-                    url = f"http://localhost:{current_config['status_port']}/config"
+                    url = detector_endpoint('/config')
                     data = json.dumps(detector_config).encode('utf-8')
                     req = urllib.request.Request(url, data=data, method='POST')
                     req.add_header('Content-Type', 'application/json')
