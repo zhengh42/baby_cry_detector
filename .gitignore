@@ -28,8 +28,9 @@ bck/
 logs/
 .github/
 
-# Test scripts
-test_*.py
+# Hardware probe scripts in the project root (test_rainbowhat.py etc).
+# Anchored so the tests/ suite is still tracked.
+/test_*.py
 
 # Notes
 *.md

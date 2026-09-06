@@ -161,6 +161,33 @@ python cry_detector.py --pushover --healthcheck https://hc-ping.com/your-uuid
 - `--healthcheck` - Healthchecks.io ping URL for uptime monitoring
 - `--heartbeat` - Heartbeat interval in minutes (default: 5)
 
+### Tests
+
+The suite runs without a microphone, without a Rainbow HAT, and without touching
+Pushover or healthchecks.io: a fake PyAudio feeds synthetic audio (sine waves for
+crying, silence, noise) through the real detection code, and a fake clock makes
+minute-long timelines run instantly.
+
+```bash
+python3 -m unittest discover -s tests          # all of it, ~9 seconds
+python3 -m unittest discover -s tests -v       # with test names
+python3 -m unittest discover -s tests -p test_detection.py   # one module
+```
+
+Needs `numpy` (already required by the detector). The web controller tests are
+skipped automatically if `flask` is not installed.
+
+| module | covers |
+|---|---|
+| `test_detection.py` | per-chunk detection: cries vs hum, rumble, hiss, noise; threshold edges |
+| `test_episodes.py` | brief sounds ignored, episode start, alarm, repeat alarm, settle |
+| `test_stream_health.py` | dead or unplugged mic, reconnect, recovery, silent-mic alert |
+| `test_status_server.py` | `/status` payload, `/config` clamping and rejection, localhost binding |
+| `test_config_api.py` | setting limits, device whitelist, `stop_at`, persistence |
+| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning |
+| `test_heartbeat.py` | heartbeat retry bounds and thread cleanup |
+| `test_shutdown.py` | SIGTERM shutdown of the real script: clean exit, recording flushed, bad arguments refused |
+
 ### Receiver (Rainbow HAT) — Optional
 
 For a secondary alert device using a second Raspberry Pi with a Rainbow HAT (LED indicators, buzzer, display), see [RECEIVER.md](RECEIVER.md).
