@@ -83,6 +83,9 @@ CONFIG_LIMITS = {
 
 # Persisted settings, so a reboot or service restart keeps the last config
 CONFIG_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'monitor_config.json')
+# Kept apart from monitor_config.json: that file is the settings the phone can
+# edit, this is one bit of runtime state that no client should be able to POST.
+DETECTOR_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'detector_state.json')
 
 # State
 detector_process = None
@@ -193,6 +196,73 @@ def save_config():
             _last_saved_config = snapshot
     except Exception as e:
         print(f"Warning: could not save config to {CONFIG_STATE_FILE}: {e}")
+
+def save_detector_state(running):
+    """Remember whether the detector is meant to be listening.
+
+    Written on every start and stop so a reboot can tell an interrupted session
+    apart from one that was deliberately ended.
+    """
+    try:
+        tmp_path = DETECTOR_STATE_FILE + '.tmp'
+        with open(tmp_path, 'w') as f:
+            json.dump({'running': bool(running)}, f)
+        os.replace(tmp_path, DETECTOR_STATE_FILE)
+    except Exception as e:
+        print(f"Warning: could not save detector state to {DETECTOR_STATE_FILE}: {e}")
+
+
+def detector_was_running():
+    """Whether the detector was listening when the monitor last went down."""
+    try:
+        with open(DETECTOR_STATE_FILE) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"Warning: could not read {DETECTOR_STATE_FILE}: {e}")
+        return False
+    return bool(state.get('running')) if isinstance(state, dict) else False
+
+
+def resume_detector_after_boot():
+    """Start listening again if that is what the monitor was doing when it died.
+
+    Only the web controller is a systemd service; the detector is a child process
+    it launches on START. A power cut therefore came back as a working dashboard
+    with nothing listening to the baby - and, from the healthcheck alert alone,
+    that looks exactly like the power still being out.
+
+    The flag is cleared by STOP and by a clean auto-stop, so this only ever
+    resumes an interrupted session. A crash leaves it set: a fresh boot is a
+    plausible cure for whatever the detector died of, and it is one attempt, not
+    a retry loop. A session resumed after its --stop-at time has passed runs
+    until the next one.
+    """
+    if not detector_was_running():
+        return
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    note = (f"[{timestamp}] Detector was running when the monitor last went down "
+            "- resuming")
+    with log_lock:
+        event_log_buffer.append(note)
+    write_controller_log(note)
+
+    # Never let a failed resume take the dashboard down with it: this runs
+    # unattended at boot, and a phone that can still reach the page and press
+    # START is worth far more than a clean traceback in the journal.
+    try:
+        success, message = start_detector()
+    except Exception as e:
+        success, message = False, f"{type(e).__name__}: {e}"
+    if not success:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        failed = f"[{timestamp}] Could not resume the detector: {message}"
+        with log_lock:
+            event_log_buffer.append(failed)
+        write_controller_log(failed)
+        print(failed)
+
 
 # ANSI color code stripping
 import re
@@ -316,7 +386,9 @@ def process_monitor(process):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if returncode == 0:
-        # Clean shutdown, i.e. the --stop-at time was reached
+        # Clean shutdown, i.e. the --stop-at time was reached. The session is over
+        # on purpose, so a later reboot must not resume it.
+        save_detector_state(False)
         hc_paused = pause_healthcheck()
         msg = f"[{timestamp}] Detector exited normally (auto-stop)"
         if hc_paused:
@@ -449,6 +521,9 @@ def start_detector():
 
         # A fresh start clears the previous crash banner
         last_failure = None
+
+        # Survives a power cut: a reboot resumes this session
+        save_detector_state(True)
 
         return True, f"Detector started (log: {LOG_FILE})"
     except Exception as e:
@@ -1412,6 +1487,11 @@ def api_start():
 def api_stop():
     """Stop the detector"""
     success, message = stop_detector()
+    if success:
+        # Only an explicit STOP ends the session. cleanup() also stops the
+        # detector when the controller itself is signalled (a service restart, a
+        # clean reboot), and that must still resume afterwards.
+        save_detector_state(False)
     return jsonify({'success': success, 'message': message})
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -1487,5 +1567,8 @@ if __name__ == '__main__':
     print(f"Starting Baby Monitor Web Controller")
     print(f"Open http://<your-pi-ip>:{args.port} on your phone")
     print(f"Press Ctrl+C to stop")
+
+    # Under __main__ only: importing this module must never spawn a detector
+    resume_detector_after_boot()
 
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

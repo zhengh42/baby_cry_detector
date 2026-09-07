@@ -14,6 +14,7 @@ credentials.py
 
 # Persisted runtime settings
 monitor_config.json
+detector_state.json
 
 # IDE
 .vscode/

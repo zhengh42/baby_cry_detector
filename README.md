@@ -85,6 +85,8 @@ localhost only, so it is not reachable from other machines regardless.
 ### 5. Set up systemd service (recommended)
 
 Systemd makes the web controller start automatically on boot and restart if it crashes.
+The controller then resumes the detector itself if it was listening when the Pi went down,
+so a power cut does not leave the baby unmonitored until someone presses START.
 
 Create `/etc/systemd/system/babymonitor-web.service`:
 ```ini
@@ -131,6 +133,7 @@ The recommended way to run the monitor. Open `http://<your-pi-ip>:5000` on your 
 - Configuration form for all detector parameters — changes apply instantly to the running detector (no restart needed) and sync live across all open phones without refreshing
 - Event log and real-time log viewer with auto-scroll — configuration changes (alert/reset windows, device/mute switches, etc.) are recorded in the event log
 - Settings persist across restarts and reboots (saved to `monitor_config.json`)
+- Resumes monitoring by itself after a power cut: if the detector was listening when the Pi lost power, it starts again on boot (recorded in `detector_state.json`). Pressing STOP or reaching `--stop-at` ends the session for good, so only an interrupted one is resumed
 - Event log is kept across detector sessions, and config changes are also appended to `/var/log/babymonitor/controller.log`
 - Shows NO AUDIO if the detector loses the microphone, instead of reporting "all quiet"
 - Red banner if the detector exits unexpectedly (crash, bad setting), with the error and a Dismiss button; the healthcheck is only paused on a clean stop, so a crash still escalates
@@ -184,7 +187,7 @@ skipped automatically if `flask` is not installed.
 | `test_stream_health.py` | dead or unplugged mic, reconnect, recovery, silent-mic alert |
 | `test_status_server.py` | `/status` payload, `/config` clamping and rejection, localhost binding |
 | `test_config_api.py` | setting limits, device whitelist, `stop_at`, persistence |
-| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning |
+| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning, power-cut resume |
 | `test_heartbeat.py` | heartbeat retry bounds and thread cleanup |
 | `test_notifications.py` | emergency alert retried through a brief outage, never sent on the monitor loop |
 | `test_shutdown.py` | SIGTERM shutdown of the real script: clean exit, recording flushed, bad arguments refused |

@@ -229,5 +229,121 @@ class StatusTests(fakes.WebControllerTestCase):
             self.assertIn(f'btn-{device}', page)
 
 
+class PowerCutResumeTests(fakes.WebControllerTestCase):
+    """Coming back from a power cut.
+
+    Only the web controller is a systemd service; the detector is a child process
+    it launches on START. A reboot therefore used to come back as a working
+    dashboard with nothing listening to the baby - which, from the healthcheck
+    alert alone, is indistinguishable from the power still being out.
+    """
+
+    def start_with_fake_process(self):
+        process = self.spawn(RUN_FOREVER)
+        original_popen = subprocess.Popen
+        subprocess.Popen = lambda *a, **k: process
+        try:
+            return self.wc.start_detector()
+        finally:
+            subprocess.Popen = original_popen
+
+    def resume(self, outcome=(True, 'started')):
+        """Run the boot-time resume with a stubbed start; did it try to start?"""
+        calls = []
+
+        def fake_start():
+            calls.append(True)
+            return outcome
+
+        original = self.wc.start_detector
+        self.wc.start_detector = fake_start
+        try:
+            self.wc.resume_detector_after_boot()
+        finally:
+            self.wc.start_detector = original
+        return bool(calls)
+
+    def test_starting_records_that_the_detector_should_be_listening(self):
+        ok, _ = self.start_with_fake_process()
+        self.assertTrue(ok)
+        self.assertTrue(self.wc.detector_was_running())
+
+    def test_a_reboot_resumes_an_interrupted_session(self):
+        self.start_with_fake_process()
+        self.assertTrue(self.resume(),
+                        "a power cut would leave the baby unmonitored until "
+                        "someone noticed and pressed START")
+
+    def test_the_resume_is_explained_in_the_event_log(self):
+        self.start_with_fake_process()
+        self.resume()
+        self.assertTrue(any('resuming' in event for event in self.events()),
+                        "a detector that started on its own must say why")
+
+    def test_pressing_stop_ends_the_session_for_good(self):
+        self.start_with_fake_process()
+        self.client.post('/api/stop')
+        self.assertFalse(self.wc.detector_was_running())
+        self.assertFalse(self.resume(),
+                         "a session stopped on purpose must stay stopped")
+
+    def test_a_clean_auto_stop_ends_the_session_for_good(self):
+        self.start_with_fake_process()
+        process = self.spawn(EXIT_CLEAN)
+        self.wc.detector_process = process
+        self.wc.process_monitor(process)
+        self.assertFalse(self.resume(),
+                         "--stop-at ended the night deliberately")
+
+    def test_a_crash_is_retried_on_the_next_boot(self):
+        self.start_with_fake_process()
+        process = self.spawn(EXIT_CRASH)
+        self.wc.detector_process = process
+        self.wc.process_monitor(process)
+        self.assertTrue(self.resume(),
+                        "a fresh boot may well cure whatever it died of")
+
+    def test_restarting_the_controller_still_resumes(self):
+        # cleanup() stops the detector when the service is restarted or the Pi is
+        # rebooted cleanly, and there the user never asked to stop monitoring
+        self.start_with_fake_process()
+        self.wc.stop_detector()
+        self.assertTrue(self.resume())
+
+    def test_a_fresh_install_starts_nothing(self):
+        self.assertFalse(os.path.exists(self.wc.DETECTOR_STATE_FILE))
+        self.assertFalse(self.resume())
+
+    def test_an_unreadable_state_file_starts_nothing(self):
+        with open(self.wc.DETECTOR_STATE_FILE, 'w') as f:
+            f.write('{ not json')
+        self.assertFalse(self.wc.detector_was_running())
+        self.assertFalse(self.resume())
+
+    def test_a_resume_that_fails_says_so_in_the_event_log(self):
+        self.wc.save_detector_state(True)
+        self.resume(outcome=(False, 'Failed to start: boom'))
+        self.assertTrue(any('Could not resume' in event for event in self.events()))
+
+    def test_a_resume_that_raises_does_not_take_the_dashboard_down(self):
+        # runs unattended at boot: an unwritable log dir or a bad SD card must
+        # still leave a page the phone can reach and press START on
+        self.wc.save_detector_state(True)
+        original = self.wc.start_detector
+
+        def exploding_start():
+            raise PermissionError("/var/log/babymonitor")
+
+        self.wc.start_detector = exploding_start
+        try:
+            self.wc.resume_detector_after_boot()
+        finally:
+            self.wc.start_detector = original
+        self.assertTrue(any('Could not resume' in event for event in self.events()))
+        self.assertTrue(any('PermissionError' in event for event in self.events()))
+        self.assertTrue(self.client.get('/api/status').get_json() is not None,
+                        "the dashboard must still answer")
+
+
 if __name__ == '__main__':
     unittest.main()

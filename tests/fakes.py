@@ -370,6 +370,7 @@ class WebControllerTestCase(unittest.TestCase):
             'fail': wc.fail_healthcheck,
             'log_dir': wc.LOG_DIR,
             'state_file': wc.CONFIG_STATE_FILE,
+            'detector_state_file': wc.DETECTOR_STATE_FILE,
             'config': dict(wc.current_config),
             'logger_disabled': wc.app.logger.disabled,
         }
@@ -377,6 +378,7 @@ class WebControllerTestCase(unittest.TestCase):
         wc.fail_healthcheck = lambda: self._record('fail')
         wc.LOG_DIR = os.path.join(self.tmpdir, 'log')
         wc.CONFIG_STATE_FILE = os.path.join(self.tmpdir, 'monitor_config.json')
+        wc.DETECTOR_STATE_FILE = os.path.join(self.tmpdir, 'detector_state.json')
         wc.LOG_FILE = None
         wc.current_config.clear()
         wc.current_config.update(wc.DEFAULT_CONFIG)
@@ -431,6 +433,7 @@ class WebControllerTestCase(unittest.TestCase):
         wc.fail_healthcheck = self._saved['fail']
         wc.LOG_DIR = self._saved['log_dir']
         wc.CONFIG_STATE_FILE = self._saved['state_file']
+        wc.DETECTOR_STATE_FILE = self._saved['detector_state_file']
         wc.current_config.clear()
         wc.current_config.update(self._saved['config'])
         wc.app.logger.disabled = self._saved['logger_disabled']
