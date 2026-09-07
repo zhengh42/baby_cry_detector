@@ -186,6 +186,7 @@ skipped automatically if `flask` is not installed.
 | `test_config_api.py` | setting limits, device whitelist, `stop_at`, persistence |
 | `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning |
 | `test_heartbeat.py` | heartbeat retry bounds and thread cleanup |
+| `test_notifications.py` | emergency alert retried through a brief outage, never sent on the monitor loop |
 | `test_shutdown.py` | SIGTERM shutdown of the real script: clean exit, recording flushed, bad arguments refused |
 
 ### Receiver (Rainbow HAT) — Optional

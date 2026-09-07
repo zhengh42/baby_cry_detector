@@ -81,6 +81,10 @@ MAX_RECORDING_FRAMES = 5000
 # Pushover emergency notification settings
 PUSHOVER_RETRY = 30   # Retry every 30 seconds if not acknowledged
 PUSHOVER_EXPIRE = 3600  # Give up after 1 hour
+# RETRY/EXPIRE above are retries Pushover's own servers make once they hold the
+# message. They do nothing for a message that never arrived, so we retry the
+# delivery ourselves too.
+PUSHOVER_SEND_RETRY = 30  # Seconds between our own attempts to deliver an alert
 
 # Silent mic detection
 MIC_SILENT_THRESHOLD = 5  # Volume below this is considered "dead silence"
@@ -487,6 +491,81 @@ class CryDetector:
 
         threading.Thread(target=_send, args=(url, is_fail), daemon=True).start()
 
+    def ping_healthcheck_fail(self, healthcheck_url):
+        """Escalate through healthchecks.io when an alert could not be delivered,
+        so a phone that never buzzed still surfaces somewhere."""
+        if not healthcheck_url:
+            return
+        try:
+            urllib.request.urlopen(healthcheck_url.rstrip('/') + '/fail', timeout=10)
+            print(f"{YELLOW}⚠ Healthcheck FAIL sent (Pushover delivery failed){RESET}")
+        except Exception:
+            pass
+
+    def send_emergency_notification(self, elapsed_time):
+        """Deliver the emergency alert from a background thread, retrying on failure.
+
+        Sending inline cost us twice over. The pushover library posts with no
+        timeout, so a half-dead network (router up, nothing getting through) parked
+        the monitor loop in a connect for as long as the OS allowed - not reading
+        audio, not sending heartbeats, and reporting a stale status that made the
+        web UI blame the microphone. And one failed POST discarded the alert
+        outright, so a brief blip at the wrong moment meant no notification at all,
+        with the next attempt a full alert_window of crying away.
+
+        Retries stop before the next alert could fire, so an outage cannot stack up
+        one retrying thread per alert.
+        """
+        client = self.pushover_client
+        device = self.pushover_device
+        healthcheck_url = self.healthcheck_url
+        start = time.time()
+        deadline = start + max(self.alert_window, PUSHOVER_SEND_RETRY)
+
+        def _send():
+            attempt = 0
+            while True:
+                message = (f"Baby has been crying for {elapsed_time/60:.1f} minutes! "
+                           "Please check on the baby.")
+                late = time.time() - start
+                if late >= PUSHOVER_SEND_RETRY:
+                    # Say so rather than letting a delayed alert read as current
+                    message += (f" (Alert delayed {late/60:.0f} min - the monitor "
+                                "could not reach the network.)")
+                try:
+                    client.send_message(
+                        message,
+                        title="🚨 BABY MONITOR EMERGENCY",
+                        priority=2,  # Emergency - requires acknowledgment
+                        retry=PUSHOVER_RETRY,    # Retry every 30 seconds
+                        expire=PUSHOVER_EXPIRE,  # Give up after 1 hour
+                        device=device  # None sends to all devices
+                    )
+                except Exception as e:
+                    attempt += 1
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    if time.time() + PUSHOVER_SEND_RETRY >= deadline:
+                        print(f"{RED}[{timestamp}] ✗ Emergency notification FAILED after "
+                              f"{attempt} {'try' if attempt == 1 else 'tries'}, "
+                              f"giving up: {e}{RESET}")
+                        self.ping_healthcheck_fail(healthcheck_url)
+                        return
+                    print(f"{YELLOW}[{timestamp}] ⚠ Emergency notification failed "
+                          f"(retry in {PUSHOVER_SEND_RETRY}s): {e}{RESET}")
+                    time.sleep(PUSHOVER_SEND_RETRY)
+                    continue
+
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                msg = (f"[{timestamp}] ✓ Emergency notification sent! "
+                       f"(will retry every {PUSHOVER_RETRY}s until acknowledged)")
+                if attempt:
+                    msg += f" (delivered after {attempt} failed "
+                    msg += f"{'try' if attempt == 1 else 'tries'})"
+                print(f"{GREEN}{msg}{RESET}")
+                return
+
+        threading.Thread(target=_send, daemon=True).start()
+
     def maybe_send_heartbeat(self, current_time):
         """Send a heartbeat if enabled and the interval has elapsed."""
         if not self.healthcheck_url:
@@ -730,28 +809,11 @@ class CryDetector:
                         print(f"\n{RED}[{timestamp}] 🚨 ALERT! Baby has been crying for {elapsed_time/60:.1f} minutes!{RESET}")
                         print(f"{RED}   (Episode started at {datetime.fromtimestamp(self.initial_start_time).strftime('%H:%M:%S')}, currently crying){RESET}")
 
-                        # Send EMERGENCY Pushover notification (skip if muted)
+                        # Send EMERGENCY Pushover notification (skip if muted).
+                        # Handed to a background thread: the monitor loop must keep
+                        # listening to the baby whatever the network is doing.
                         if self.pushover_client and self.enable_pushover and self.pushover_device != '__muted__':
-                            try:
-                                self.pushover_client.send_message(
-                                    f"Baby has been crying for {elapsed_time/60:.1f} minutes! Please check on the baby.",
-                                    title="🚨 BABY MONITOR EMERGENCY",
-                                    priority=2,  # Emergency - requires acknowledgment
-                                    retry=PUSHOVER_RETRY,    # Retry every 30 seconds
-                                    expire=PUSHOVER_EXPIRE,  # Give up after 1 hour
-                                    device=self.pushover_device  # None sends to all devices
-                                )
-                                print(f"{GREEN}✓ Emergency notification sent! (will retry every {PUSHOVER_RETRY}s until acknowledged){RESET}")
-                            except Exception as e:
-                                print(f"{RED}✗ Failed to send notification: {e}{RESET}")
-                                # Alert via healthcheck that Pushover failed
-                                if self.healthcheck_url:
-                                    try:
-                                        fail_url = self.healthcheck_url.rstrip('/') + '/fail'
-                                        urllib.request.urlopen(fail_url, timeout=10)
-                                        print(f"{YELLOW}⚠ Healthcheck FAIL sent (Pushover delivery failed){RESET}")
-                                    except Exception:
-                                        pass
+                            self.send_emergency_notification(elapsed_time)
                         elif self.pushover_device == '__muted__':
                             print(f"{YELLOW}🔇 Notification muted{RESET}")
 
