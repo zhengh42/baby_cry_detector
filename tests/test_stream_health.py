@@ -84,6 +84,31 @@ class StreamHealthTests(unittest.TestCase):
         self.assertIn("Baby started crying", output)
         self.assertIn("ALERT!", output)
 
+    def test_a_mic_that_dies_mid_cry_does_not_alarm_on_reconnect(self):
+        # Smoothing needs only 2 positives in 5 chunks, so the pre-outage chunks
+        # left in the window used to re-confirm crying on the first chunk back,
+        # against an alert clock that ran the whole time the mic was dead
+        output = self.build([(10, fakes.cry()), (60, fakes.DEVICE_GONE),
+                             (20, fakes.silence())])
+        self.assertIn("Audio stream recovered", output)
+        self.assertNotIn("ALERT!", output,
+                         "a quiet room after an outage must not raise the alarm")
+        self.assertFalse(self.detector.alarm_active)
+
+    def test_the_smoothing_window_is_empty_after_an_outage(self):
+        self.build([(10, fakes.cry()), (30, fakes.DEVICE_GONE)])
+        self.assertEqual(len(self.detector.recent_detections), 0,
+                         "chunks from before the outage say nothing about the room now")
+        self.assertIsNone(self.detector.potential_cry_start_time)
+
+    def test_a_short_dropout_does_not_restart_a_real_episode(self):
+        # the flip side: a blip during genuine crying should not lose the episode
+        output = self.build([(10, fakes.cry()), (4, fakes.READ_ERROR),
+                             (40, fakes.cry())])
+        self.assertEqual(output.count("Baby started crying"), 1,
+                         "a brief dropout should not look like a brand new episode")
+        self.assertIn("ALERT!", output)
+
     def test_silent_mic_detection_still_works(self):
         # dead silence for longer than MIC_SILENT_DURATION, stream otherwise fine
         output = self.build([(cd.MIC_SILENT_DURATION + 30, fakes.silence())])

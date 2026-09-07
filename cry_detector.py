@@ -365,6 +365,23 @@ class CryDetector:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"{RED}[{timestamp}] ✗ {message}{RESET}")
 
+    def reset_detection_state(self):
+        """Discard the smoothing window and any unconfirmed cry after an outage.
+
+        Chunks captured before the mic died say nothing about the room after it
+        came back, and CRY_CONFIRMATION_COUNT of them are enough to re-confirm
+        crying on the very first chunk of the reconnect. Since the alert window
+        is measured from initial_start_time, which kept running while the mic
+        was dead, a mic that dropped mid-cry would fire an emergency alert into
+        a silent room. Clearing this forces a fresh min_cry_duration of real
+        audio before anything can alarm again; the episode itself is left alone
+        so a brief dropout does not lose a genuine cry, and an outage longer
+        than reset_window still settles the episode on the silence that follows.
+        """
+        self.recent_detections.clear()
+        self.potential_cry_start_time = None
+        self.last_smoothed_cry_time = None
+
     def reset_audio_backend(self):
         """Re-create the PyAudio instance so a re-plugged USB mic is rediscovered.
 
@@ -588,6 +605,7 @@ class CryDetector:
                     self.stream_ok = False
                     self.log_stream_error(f"Audio stream error: {e} - attempting to reconnect")
                     self.cleanup_stream()
+                    self.reset_detection_state()
                     time.sleep(2)
                     continue
 
