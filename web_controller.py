@@ -4,6 +4,7 @@ Web Controller for Baby Cry Detector.
 Provides a mobile-friendly web interface to start/stop and configure cry_detector.py
 """
 import subprocess
+import functools
 import os
 import signal
 import sys
@@ -47,6 +48,11 @@ LOG_FILE = None  # Will be set when detector starts
 # The per-run detector log is moved to USB on stop, so config changes made while
 # stopped had nowhere to go. This log belongs to the controller and always exists.
 CONTROLLER_LOG = "controller.log"
+# Finished run logs are moved here, off the SD card
+USB_LOG_DIR = "/media/tinybaby/usb-data/logs"
+# How many run logs to leave on the card. The detector prints a line or two a
+# second all night, so nothing that is never cleaned up can be left unbounded.
+MAX_KEPT_LOGS = 20
 
 # Configuration defaults
 DEFAULT_CONFIG = {
@@ -97,6 +103,14 @@ running_status_port = None  # status port the live detector was launched with; n
                             # cleared on exit because every use is behind is_running()
 current_config = DEFAULT_CONFIG.copy()
 config_lock = threading.Lock()
+# Serialises START and STOP. Flask serves requests on threads, so two phones (or
+# one double-tap, or a phone racing the boot resume) could both pass the "already
+# running?" check and both spawn a detector. The loser cannot bind the status port
+# and dies, while the winner keeps the microphone in a process the controller is
+# no longer tracking: the dashboard says STOPPED, STOP does nothing, and the
+# orphan's heartbeats keep the healthcheck green. Nothing short of ssh gets you
+# out of that, so the check and the spawn have to happen as one step.
+process_lock = threading.Lock()
 _last_saved_config = None  # last snapshot written to disk, to skip no-op saves
 log_buffer = deque(maxlen=100)  # Keep last 100 log lines
 event_log_buffer = deque(maxlen=300)  # Key events only
@@ -106,6 +120,15 @@ log_lock = threading.Lock()
 EVENT_PATTERNS = ['Baby started crying', 'Ignored brief sound', 'ALERT', 'Baby settled',
                   'MICROPHONE SILENT', 'Microphone recovered', 'Heartbeat FAIL', 'Heartbeat failed',
                   'Audio stream error', 'Audio stream recovered', 'Reconnection failed']
+
+
+def serialized(fn):
+    """Run fn holding process_lock, so only one start or stop happens at a time."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with process_lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def sanitize_config_value(key, value):
@@ -205,15 +228,6 @@ RESUME_STARTUP_GRACE = 3     # seconds to confirm the detector survived startup
 # attempt is expected (USB may not be up yet) and the resume escalates itself if
 # it never comes up, so per-attempt escalation would only cry wolf.
 resume_in_progress = False
-
-
-def log_event(text):
-    """Record a timestamped line in the event log, the controller log and stdout."""
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}"
-    with log_lock:
-        event_log_buffer.append(line)
-    write_controller_log(line)
-    print(line)
 
 
 def save_detector_state(running):
@@ -390,12 +404,60 @@ def log_event(message):
         log_buffer.append(log_line)
         event_log_buffer.append(log_line)
     write_controller_log(log_line)
+    # Also to stdout, so boot-time messages (a resume, a resume that failed) land
+    # in journalctl -u babymonitor-web even if /var/log is not writable yet
+    print(log_line)
     if LOG_FILE and os.path.exists(LOG_FILE):
         try:
             with open(LOG_FILE, 'a') as f:
                 f.write(log_line + "\n")
         except Exception:
             pass
+
+def archive_log(path=None):
+    """Move the finished run's log off the SD card and onto the USB drive.
+
+    Called for every exit that ends a session, not only a STOP from the phone:
+    a night that ended at its own --stop-at time used to leave its log behind,
+    and at a few MB a night that is a slow way to fill up the card /var/log
+    lives on. The copy has to succeed before the original goes, so an unmounted
+    USB drive costs nothing but the move.
+    """
+    path = LOG_FILE if path is None else path
+    if not path or not os.path.exists(path):
+        return
+    try:
+        import shutil
+        os.makedirs(USB_LOG_DIR, exist_ok=True)
+        shutil.copy2(path, USB_LOG_DIR)
+        os.remove(path)
+        print(f"Log moved to {USB_LOG_DIR}/{os.path.basename(path)}")
+    except Exception as e:
+        print(f"Failed to move log to USB: {e}")
+
+
+def prune_old_logs():
+    """Keep only the newest MAX_KEPT_LOGS run logs on the card.
+
+    A crashed run's log is deliberately left behind to be read, and every other
+    kind of exit archives its own, so the ones nobody archived would otherwise
+    pile up for as long as the Pi runs.
+    """
+    try:
+        logs = sorted(
+            (entry.path for entry in os.scandir(LOG_DIR)
+             if entry.is_file() and entry.name.startswith('detector_')
+             and entry.name.endswith('.log')),
+            key=os.path.getmtime, reverse=True)
+    except Exception:
+        return
+    for path in logs[MAX_KEPT_LOGS:]:
+        try:
+            os.remove(path)
+            print(f"Removed old log {os.path.basename(path)}")
+        except Exception:
+            pass
+
 
 def log_reader(process, log_file_path):
     """Read process output and store in log buffer and file"""
@@ -420,15 +482,23 @@ def log_reader(process, log_file_path):
         with log_lock:
             log_buffer.append(f"[ERROR] Log reader: {e}")
 
-def process_monitor(process):
+def process_monitor(process, log_path=None):
     """React when the detector exits on its own.
 
     A stop requested from the web UI is handled by stop_detector(), so this only
     fires for self-exits: a clean auto-stop, or a crash / startup failure.
     Pausing the healthcheck is reserved for clean exits - pausing after a crash
     would silence the one alert that says nobody is watching the baby.
+
+    Carries the log path of the run it is watching, like log_reader does. This
+    thread does its work after the exit, some of it behind network timeouts, and
+    by then a phone may have started the next session: writing to the global
+    would append this run's ending to the new run's log, and archiving it would
+    move that live log to USB and unlink it mid-night.
     """
     global detector_process
+    if log_path is None:
+        log_path = LOG_FILE
     process.wait()  # Block until process exits
 
     if process.pid in stopping_pids:
@@ -461,6 +531,9 @@ def process_monitor(process):
         msg = f"[{timestamp}] Detector exited UNEXPECTEDLY ({reason}) - NOT monitoring"
         if hc_failed:
             msg += " (healthcheck FAIL sent)"
+        elif resume_in_progress:
+            # nothing was attempted, so don't report it as a failed attempt
+            msg += " (boot resume still trying; it escalates if it gives up)"
         elif current_config.get('enable_healthcheck'):
             msg += " (healthcheck FAIL could not be sent)"
         extra = None
@@ -491,15 +564,22 @@ def process_monitor(process):
             'escalated': bool(hc_failed),
         }
 
-    if LOG_FILE and os.path.exists(LOG_FILE):
+    if log_path and os.path.exists(log_path):
         try:
-            with open(LOG_FILE, 'a') as f:
+            with open(log_path, 'a') as f:
                 f.write(msg + "\n")
                 if extra:
                     f.write(extra + "\n")
         except Exception:
             pass
 
+    if returncode == 0:
+        # The session ended on purpose, so file the log away exactly as a STOP
+        # would. A crash keeps its log on the card, where it can still be read.
+        archive_log(log_path)
+
+
+@serialized
 def start_detector():
     """Start the cry detector process"""
     global detector_process, log_buffer, LOG_FILE, last_failure, running_status_port
@@ -509,6 +589,7 @@ def start_detector():
 
     # Create log directory if needed
     os.makedirs(LOG_DIR, exist_ok=True)
+    prune_old_logs()
 
     # Create log file with timestamp
     log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -574,7 +655,8 @@ def start_detector():
         log_thread.start()
 
         # Start process monitor thread (detects auto-stop and pauses healthcheck)
-        monitor_thread = threading.Thread(target=process_monitor, args=(detector_process,), daemon=True)
+        monitor_thread = threading.Thread(target=process_monitor,
+                                          args=(detector_process, LOG_FILE), daemon=True)
         monitor_thread.start()
 
         # A fresh start clears the previous crash banner
@@ -643,6 +725,7 @@ def fail_healthcheck():
         return False
 
 
+@serialized
 def stop_detector():
     """Stop the cry detector process"""
     global detector_process
@@ -697,16 +780,7 @@ def stop_detector():
         if LOG_FILE and os.path.exists(LOG_FILE):
             with open(LOG_FILE, 'a') as f:
                 f.write(stop_msg + "\n")
-            # Move log to USB drive for archival
-            usb_log_dir = "/media/tinybaby/usb-data/logs"
-            try:
-                os.makedirs(usb_log_dir, exist_ok=True)
-                import shutil
-                shutil.copy2(LOG_FILE, usb_log_dir)
-                os.remove(LOG_FILE)
-                print(f"Log moved to {usb_log_dir}/{os.path.basename(LOG_FILE)}")
-            except Exception as e:
-                print(f"Failed to move log to USB: {e}")
+        archive_log()
         return True, "Detector stopped (forced)" if forced else "Detector stopped"
     except Exception as e:
         return False, f"Failed to stop: {e}"
@@ -1288,17 +1362,28 @@ HTML_TEMPLATE = """
         }
 
         async function startDetector() {
+            // The button is only re-enabled by the 2-second status poll, so
+            // disable it here too: a second tap on a slow connection asks for a
+            // second detector. The controller refuses one either way, but this
+            // keeps the request from being sent at all.
+            document.getElementById('btn-start').disabled = true;
             const config = getConfig();
-            const resp = await fetch('/api/start', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(config)
-            });
-            const data = await resp.json();
-            if (data.success) {
-                updateUI(true, null);
-            } else {
-                alert(data.message);
+            try {
+                const resp = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(config)
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    updateUI(true, null);
+                } else {
+                    alert(data.message);
+                    updateUI(false, null);
+                }
+            } catch (e) {
+                alert('Could not reach the monitor: ' + e);
+                updateUI(false, null);
             }
         }
 
@@ -1313,6 +1398,9 @@ HTML_TEMPLATE = """
         }
 
         async function restartDetector() {
+            // Same reason as startDetector: no second request while this one runs
+            document.getElementById('btn-restart').disabled = true;
+            document.getElementById('btn-start').disabled = true;
             // Stop first
             const stopResp = await fetch('/api/stop', {method: 'POST'});
             const stopData = await stopResp.json();

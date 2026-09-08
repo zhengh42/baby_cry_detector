@@ -139,7 +139,7 @@ The recommended way to run the monitor. Open `http://<your-pi-ip>:5000` on your 
 - Shows NO AUDIO if the detector loses the microphone, instead of reporting "all quiet"
 - Red banner if the detector exits unexpectedly (crash, bad setting), with the error and a Dismiss button; the healthcheck is only paused on a clean stop, so a crash still escalates
 - Auto-pauses healthcheck when stopping (prevents false alerts)
-- Log files moved to USB drive on stop for archival
+- Log files moved to the USB drive when a session ends, whether it ends with STOP or at its own `--stop-at` time; a crashed run keeps its log on the card to be read, and only the newest 20 are kept there
 
 ### Cry Detector CLI (`cry_detector.py`)
 
@@ -159,7 +159,7 @@ python cry_detector.py --pushover --healthcheck https://hc-ping.com/your-uuid
 - `--reset` - Minutes of silence before episode reset (default: 5)
 - `--min-cry` - Seconds of sustained crying before confirming episode (default: 4)
 - `--silence-gap` - Seconds of silence within crying that resets detection (default: 2)
-- `--stop-at` - Time to auto-stop the script (HH:MM format, e.g. 07:00)
+- `--stop-at` - Time to auto-stop the script (HH:MM format, e.g. 07:00). Any point in that minute will do, so a night spent retrying a dead microphone still ends in the morning
 - `--status-port` - Enable HTTP status server on this port
 - `--status-bind` - Address for the status server (default: `127.0.0.1`; use `0.0.0.0` to let other machines read it, e.g. the optional receiver)
 - `--healthcheck` - Healthchecks.io ping URL for uptime monitoring
@@ -188,7 +188,8 @@ skipped automatically if `flask` is not installed.
 | `test_stream_health.py` | dead or unplugged mic, reconnect, recovery, silent-mic alert |
 | `test_status_server.py` | `/status` payload, `/config` clamping and rejection, localhost binding |
 | `test_config_api.py` | setting limits, device whitelist, `stop_at`, persistence |
-| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning, power-cut resume |
+| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning, power-cut resume, one detector per mic, log archiving |
+| `test_autostop.py` | `--stop-at` fires even when the loop is sleeping through a dead mic, and not on a session started inside that minute |
 | `test_heartbeat.py` | heartbeat retry bounds and thread cleanup |
 | `test_notifications.py` | emergency alert retried through a brief outage, never sent on the monitor loop |
 | `test_shutdown.py` | SIGTERM shutdown of the real script: clean exit, recording flushed, bad arguments refused |

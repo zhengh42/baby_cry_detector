@@ -31,6 +31,7 @@ class StatusEndpointTests(unittest.TestCase):
         self.detector.stream_ok = True
         self.detector.mic_silent = False
         self.detector.last_chunk_time = None
+        self.detector.session_start_time = None
         self.detector.initial_start_time = None
         self.detector.last_cry_time = None
         self.detector.pushover_device = None
@@ -70,10 +71,23 @@ class StatusEndpointTests(unittest.TestCase):
         self.assertTrue(status['alarm'], "the UI and receiver key off this field")
         self.assertFalse(status['stream_ok'])
 
-    def test_seconds_since_audio_is_null_until_the_first_chunk(self):
+    def test_seconds_since_audio_is_null_before_a_session_starts(self):
         self.assertIsNone(self.get_status()['seconds_since_audio'])
         self.detector.last_chunk_time = cd.time.time()
         self.assertIsNotNone(self.get_status()['seconds_since_audio'])
+
+    def test_a_mic_that_never_delivered_a_chunk_reads_as_no_audio(self):
+        """A mic can open and then simply never return any data.
+
+        The monitor loop is parked inside read() with nothing left to notice
+        that, so this field is all the dashboard has to go on - and reporting
+        nothing let it draw a reassuring "Quiet" over a microphone that had
+        never listened at all. Time since the session started is the honest
+        answer, and it crosses the 30 seconds the dashboard calls NO AUDIO.
+        """
+        self.detector.last_chunk_time = None
+        self.detector.session_start_time = cd.time.time() - 120
+        self.assertGreater(self.get_status()['seconds_since_audio'], 30)
 
     def test_unknown_paths_are_404(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:

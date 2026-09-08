@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime as real_datetime, timedelta
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -168,6 +169,28 @@ def patched_clock(module, clock):
         yield clock
     finally:
         module.time = original
+
+
+@contextlib.contextmanager
+def patched_wall_clock(module, clock, start='2026-01-01 22:00:00'):
+    """Make the module's ``datetime.now()`` follow the fake clock too.
+
+    The auto-stop compares the time of day, so testing it needs the calendar
+    clock to move with the monotonic one rather than reading the real time.
+    """
+    base = real_datetime.strptime(start, '%Y-%m-%d %H:%M:%S')
+
+    class ClockDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return base + timedelta(seconds=clock.elapsed())
+
+    original = module.datetime
+    module.datetime = ClockDatetime
+    try:
+        yield
+    finally:
+        module.datetime = original
 
 
 # --- the fake microphone ---------------------------------------------------
@@ -369,6 +392,7 @@ class WebControllerTestCase(unittest.TestCase):
             'pause': wc.pause_healthcheck,
             'fail': wc.fail_healthcheck,
             'log_dir': wc.LOG_DIR,
+            'usb_log_dir': wc.USB_LOG_DIR,
             'state_file': wc.CONFIG_STATE_FILE,
             'detector_state_file': wc.DETECTOR_STATE_FILE,
             'config': dict(wc.current_config),
@@ -377,6 +401,7 @@ class WebControllerTestCase(unittest.TestCase):
         wc.pause_healthcheck = lambda: self._record('pause')
         wc.fail_healthcheck = lambda: self._record('fail')
         wc.LOG_DIR = os.path.join(self.tmpdir, 'log')
+        wc.USB_LOG_DIR = os.path.join(self.tmpdir, 'usb-logs')
         wc.CONFIG_STATE_FILE = os.path.join(self.tmpdir, 'monitor_config.json')
         wc.DETECTOR_STATE_FILE = os.path.join(self.tmpdir, 'detector_state.json')
         wc.LOG_FILE = None
@@ -432,6 +457,7 @@ class WebControllerTestCase(unittest.TestCase):
         wc.pause_healthcheck = self._saved['pause']
         wc.fail_healthcheck = self._saved['fail']
         wc.LOG_DIR = self._saved['log_dir']
+        wc.USB_LOG_DIR = self._saved['usb_log_dir']
         wc.CONFIG_STATE_FILE = self._saved['state_file']
         wc.DETECTOR_STATE_FILE = self._saved['detector_state_file']
         wc.current_config.clear()

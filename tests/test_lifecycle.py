@@ -7,6 +7,8 @@ watching the baby, so the pause is reserved for clean shutdowns.
 import os
 import signal
 import subprocess
+import threading
+import time
 import unittest
 
 import fakes
@@ -77,6 +79,20 @@ class ExitClassificationTests(fakes.WebControllerTestCase):
         log = ' '.join(self.controller_log())
         self.assertIn('UNEXPECTEDLY', log)
         self.assertIn('No USB audio device found', log)
+
+    def test_an_exit_during_the_boot_resume_defers_the_escalation(self):
+        # every unexpected exit escalates, but an attempt that lost the race with
+        # USB is expected here and the resume escalates itself if it gives up
+        self.wc.resume_in_progress = True
+        try:
+            self.watch(EXIT_CRASH)
+        finally:
+            self.wc.resume_in_progress = False
+        self.assertEqual(self.healthcheck_calls, [])
+        joined = ' '.join(self.events())
+        self.assertIn('boot resume still trying', joined)
+        self.assertNotIn('could not be sent', joined,
+                         "nothing was attempted, so nothing failed to send")
 
     def test_a_stale_process_is_ignored(self):
         old = self.spawn(EXIT_CRASH)
@@ -422,6 +438,149 @@ class ResumePortGuardTests(fakes.WebControllerTestCase):
             port = taken.getsockname()[1]
             self.assertFalse(self.wc.port_is_free('127.0.0.1', port))
         self.assertTrue(self.wc.port_is_free('127.0.0.1', port))
+
+
+class ConcurrentStartTests(fakes.WebControllerTestCase):
+    """One microphone, one detector, however many phones are pressing START."""
+
+    def test_two_simultaneous_starts_launch_only_one_detector(self):
+        """Both requests used to pass the "already running?" check.
+
+        Flask answers on threads, so two phones - or the boot resume racing a
+        phone - could both spawn a detector. The second cannot bind the status
+        port and dies, while the first keeps the microphone in a process the
+        controller has stopped tracking: the dashboard reads STOPPED, STOP does
+        nothing, and the orphan's heartbeats keep the healthcheck green.
+        """
+        process = self.spawn(RUN_FOREVER)   # before Popen is replaced below
+        launches = []
+        launching = threading.Event()
+        original_popen = subprocess.Popen
+
+        def slow_popen(*args, **kwargs):
+            # hold the launch open long enough for the second request to arrive
+            launching.set()
+            time.sleep(0.2)
+            launches.append(args)
+            return process
+
+        results = []
+        subprocess.Popen = slow_popen
+        try:
+            first = threading.Thread(target=lambda: results.append(self.wc.start_detector()))
+            first.start()
+            self.assertTrue(launching.wait(5), "the first start never got going")
+            results.append(self.wc.start_detector())
+            first.join(5)
+        finally:
+            subprocess.Popen = original_popen
+
+        self.assertEqual(len(launches), 1, "a second detector was put on the mic")
+        self.assertEqual(sorted(ok for ok, _ in results), [False, True])
+        refused = next(message for ok, message in results if not ok)
+        self.assertIn('already running', refused)
+
+
+class LogHousekeepingTests(fakes.WebControllerTestCase):
+    """Where a finished run's log ends up.
+
+    The detector prints a line or two every second all night. Nothing that is
+    never cleaned up can be left to accumulate on the card /var/log lives on.
+    """
+
+    def make_log(self, name, age_seconds=0):
+        os.makedirs(self.wc.LOG_DIR, exist_ok=True)
+        path = os.path.join(self.wc.LOG_DIR, name)
+        with open(path, 'w') as handle:
+            handle.write(f"log {name}\n")
+        if age_seconds:
+            stamp = time.time() - age_seconds
+            os.utime(path, (stamp, stamp))
+        return path
+
+    def watch_exit(self, code):
+        process = self.spawn(code)
+        self.wc.detector_process = process
+        self.wc.process_monitor(process)
+
+    def test_a_clean_auto_stop_archives_its_log(self):
+        # the night ended on purpose, so its log belongs on the USB drive - it
+        # used to be left on the card, where only a STOP from the phone moved it
+        self.wc.LOG_FILE = self.make_log('detector_20260101_220000.log')
+        self.watch_exit(EXIT_CLEAN)
+        self.assertFalse(os.path.exists(self.wc.LOG_FILE))
+        self.assertEqual(os.listdir(self.wc.USB_LOG_DIR),
+                         ['detector_20260101_220000.log'])
+
+    def test_a_stop_from_the_phone_still_archives_its_log(self):
+        self.wc.LOG_FILE = self.make_log('detector_20260101_220000.log')
+        process = self.spawn(RUN_FOREVER)
+        self.wc.detector_process = process
+        self.wc.stop_detector()
+        self.assertFalse(os.path.exists(self.wc.LOG_FILE))
+        self.assertEqual(os.listdir(self.wc.USB_LOG_DIR),
+                         ['detector_20260101_220000.log'])
+
+    def test_a_crash_keeps_its_log_on_the_card(self):
+        # it is the only record of what went wrong
+        self.wc.LOG_FILE = self.make_log('detector_20260101_220000.log')
+        self.watch_exit(EXIT_CRASH)
+        self.assertTrue(os.path.exists(self.wc.LOG_FILE))
+
+    def test_an_unmounted_usb_drive_loses_nothing(self):
+        self.wc.LOG_FILE = self.make_log('detector_20260101_220000.log')
+        # a file where the directory should be: makedirs fails, as it does when
+        # the drive is not mounted and the mount point is not writable
+        open(os.path.join(self.tmpdir, 'usb-logs'), 'w').close()
+        self.watch_exit(EXIT_CLEAN)
+        self.assertTrue(os.path.exists(self.wc.LOG_FILE),
+                        "the copy failed, so the original must still be there")
+
+    def test_one_run_ending_never_touches_the_next_run_s_log(self):
+        """The monitor thread finishes its work after the exit, some of it behind
+        network timeouts, so a phone can start the next session in the meantime.
+        Reading the current log path then would append this run's ending to the
+        new run's log - and archive it, moving a live log to USB and unlinking it
+        in the middle of the night."""
+        finished = self.make_log('detector_20260101_220000.log')
+        self.wc.LOG_FILE = finished
+        process = self.spawn(EXIT_CLEAN)
+        self.wc.detector_process = process
+        next_log = self.make_log('detector_20260102_050000.log')
+        self.wc.LOG_FILE = next_log      # START, while the exit is being handled
+
+        self.wc.process_monitor(process, finished)
+
+        self.assertTrue(os.path.exists(next_log), "the live log was archived away")
+        with open(next_log) as handle:
+            self.assertNotIn('exited normally', handle.read())
+        self.assertEqual(os.listdir(self.wc.USB_LOG_DIR),
+                         ['detector_20260101_220000.log'])
+
+    def test_starting_keeps_only_the_newest_logs(self):
+        kept = self.wc.MAX_KEPT_LOGS
+        for index in range(kept + 5):
+            # oldest first, so index 0 is the one furthest in the past
+            self.make_log(f'detector_2026010{index // 10}_{index:04d}00.log',
+                          age_seconds=(kept + 5 - index) * 60)
+        self.wc.write_controller_log('a line the prune must not touch')
+
+        process = self.spawn(RUN_FOREVER)
+        original_popen = subprocess.Popen
+        subprocess.Popen = lambda *a, **k: process
+        try:
+            self.assertTrue(self.wc.start_detector()[0])
+        finally:
+            subprocess.Popen = original_popen
+
+        remaining = sorted(name for name in os.listdir(self.wc.LOG_DIR)
+                           if name.startswith('detector_'))
+        self.assertEqual(len(remaining), kept + 1,
+                         "the newest logs plus the run just started")
+        self.assertNotIn('detector_20260100_000000.log', remaining,
+                         "the oldest log should have been pruned")
+        self.assertIn(os.path.basename(self.wc.LOG_FILE), remaining)
+        self.assertIn(self.wc.CONTROLLER_LOG, os.listdir(self.wc.LOG_DIR))
 
 
 if __name__ == '__main__':

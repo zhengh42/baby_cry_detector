@@ -176,10 +176,16 @@ def create_status_handler(detector):
                         silence_since = time.time() - ref_time
 
                 # Audio stream health, so consumers can tell "all quiet" apart
-                # from "not listening at all"
+                # from "not listening at all". Falls back to the session start
+                # when no chunk has ever arrived: a mic that opens but never
+                # delivers leaves the monitor loop parked in read() with nothing
+                # to notice it, and "no audio since we started" is the honest
+                # answer there - reporting nothing let the dashboard draw a
+                # reassuring "Quiet" over a microphone that was never listening.
+                reference_time = detector.last_chunk_time or detector.session_start_time
                 seconds_since_audio = None
-                if detector.last_chunk_time is not None:
-                    seconds_since_audio = round(time.time() - detector.last_chunk_time, 1)
+                if reference_time is not None:
+                    seconds_since_audio = round(time.time() - reference_time, 1)
 
                 status = {
                     "crying": detector.initial_start_time is not None,
@@ -272,6 +278,7 @@ class CryDetector:
         self.alarm_active = False  # True once an alert has fired, until the baby settles
         self.potential_cry_start_time = None  # When crying first detected (before confirmation)
         self.session_start_time = None  # When the detector session started
+        self.session_start_minute = None  # (hour, minute) it started, for auto-stop
         self.last_episode_end_time = None  # When the last crying episode ended
         
         # Recording state - only record during crying episodes
@@ -403,6 +410,8 @@ class CryDetector:
         """Start the audio stream, status server, and print config."""
         self.start_audio_stream()
         self.session_start_time = time.time()
+        now = datetime.now()
+        self.session_start_minute = (now.hour, now.minute)
         print("Cry detector started. Monitoring audio...")
         print(f"Configuration: {self.cry_freq_min}-{CRY_FREQ_MAX} Hz, Chunk: {CHUNK} samples (~{CHUNK/RATE*1000:.0f}ms)")
         print(f"Volume threshold: {self.volume_threshold}, Ratio threshold: {self.cry_ratio_threshold}")
@@ -691,9 +700,26 @@ class CryDetector:
                 # Auto-stop and heartbeats run first so they keep working even
                 # while the audio stream is down
                 if self.stop_time:
-                    now = datetime.now().time()
-                    # Stop if current time matches stop time (within 1-second window)
-                    if now.hour == self.stop_time.hour and now.minute == self.stop_time.minute and now.second < 2:
+                    now = datetime.now()
+                    # Match the whole minute, not just its first two seconds. A
+                    # dropped audio stream makes this loop sleep 2-5 seconds per
+                    # pass instead of ~0.19, and a two-second window is then
+                    # simply stepped over - so a mic that died overnight also
+                    # meant the detector never stopped in the morning.
+                    #
+                    # Still wall-clock rather than a deadline computed at start:
+                    # the Pi has no battery-backed clock, so it comes back from a
+                    # power cut believing it is still the time of the cut and NTP
+                    # then jumps it forward. A precomputed deadline would already
+                    # be in the past when that jump lands and would stop the
+                    # detector on the spot; comparing the clock as it reads now
+                    # just declines to match, and monitoring continues.
+                    #
+                    # A session that starts inside the stop minute is left alone,
+                    # otherwise starting at 07:00:30 with a 07:00 stop would quit
+                    # immediately.
+                    if ((now.hour, now.minute) == (self.stop_time.hour, self.stop_time.minute)
+                            and (now.hour, now.minute) != self.session_start_minute):
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         print(f"\n{GREEN}[{timestamp}] Auto-stop time reached ({self.stop_time.strftime('%H:%M')}). Shutting down...{RESET}")
                         break
