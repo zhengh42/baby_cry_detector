@@ -85,6 +85,7 @@ PUSHOVER_EXPIRE = 3600  # Give up after 1 hour
 # message. They do nothing for a message that never arrived, so we retry the
 # delivery ourselves too.
 PUSHOVER_SEND_RETRY = 30  # Seconds between our own attempts to deliver an alert
+PUSHOVER_SEND_TIMEOUT = 20  # Seconds to wait for one attempt before retrying
 
 # Silent mic detection
 MIC_SILENT_THRESHOLD = 5  # Volume below this is considered "dead silence"
@@ -517,21 +518,24 @@ class CryDetector:
         one retrying thread per alert.
         """
         client = self.pushover_client
-        device = self.pushover_device
         healthcheck_url = self.healthcheck_url
         start = time.time()
         deadline = start + max(self.alert_window, PUSHOVER_SEND_RETRY)
 
-        def _send():
-            attempt = 0
-            while True:
-                message = (f"Baby has been crying for {elapsed_time/60:.1f} minutes! "
-                           "Please check on the baby.")
-                late = time.time() - start
-                if late >= PUSHOVER_SEND_RETRY:
-                    # Say so rather than letting a delayed alert read as current
-                    message += (f" (Alert delayed {late/60:.0f} min - the monitor "
-                                "could not reach the network.)")
+        def _attempt(message, device):
+            """One delivery attempt, bounded in time.
+
+            The pushover library posts with no timeout and accepts no timeout
+            argument - extra keywords become request parameters - so a stalled
+            connection can park a send indefinitely. Waiting on a worker keeps
+            the retry schedule and the give-up escalation honest. A stalled
+            attempt is abandoned rather than cancelled, so it may still land
+            later: a duplicate emergency alert is a far better failure than a
+            silent one.
+            """
+            outcome = {}
+
+            def deliver():
                 try:
                     client.send_message(
                         message,
@@ -541,7 +545,41 @@ class CryDetector:
                         expire=PUSHOVER_EXPIRE,  # Give up after 1 hour
                         device=device  # None sends to all devices
                     )
-                except Exception as e:
+                    outcome['sent'] = True
+                except Exception as error:
+                    outcome['error'] = error
+
+            worker = threading.Thread(target=deliver, daemon=True)
+            worker.start()
+            worker.join(PUSHOVER_SEND_TIMEOUT)
+            if outcome.get('sent'):
+                return None
+            return outcome.get(
+                'error',
+                TimeoutError(f"no response after {PUSHOVER_SEND_TIMEOUT}s"))
+
+        def _send():
+            attempt = 0
+            while True:
+                # Re-read each time round: a parent can switch who is on duty, or
+                # mute, while we are still retrying a failed alert
+                device = self.pushover_device
+                if device == '__muted__':
+                    print(f"{YELLOW}🔇 Notifications muted while retrying; "
+                          f"alert abandoned{RESET}")
+                    return
+
+                message = (f"Baby has been crying for {elapsed_time/60:.1f} minutes! "
+                           "Please check on the baby.")
+                late = time.time() - start
+                if late >= PUSHOVER_SEND_RETRY:
+                    # Say so rather than letting a delayed alert read as current
+                    how_late = f"{late:.0f} sec" if late < 90 else f"{late/60:.0f} min"
+                    message += (f" (Alert delayed {how_late} - the monitor "
+                                "could not reach the network.)")
+
+                e = _attempt(message, device)
+                if e is not None:
                     attempt += 1
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     if time.time() + PUSHOVER_SEND_RETRY >= deadline:

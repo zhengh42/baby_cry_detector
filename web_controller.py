@@ -197,6 +197,25 @@ def save_config():
     except Exception as e:
         print(f"Warning: could not save config to {CONFIG_STATE_FILE}: {e}")
 
+# Boot resume: how hard to try before giving up and escalating
+RESUME_ATTEMPTS = 3
+RESUME_RETRY_DELAY = 15      # seconds between attempts
+RESUME_STARTUP_GRACE = 3     # seconds to confirm the detector survived startup
+# True while the boot resume is still retrying. A detector that dies on an early
+# attempt is expected (USB may not be up yet) and the resume escalates itself if
+# it never comes up, so per-attempt escalation would only cry wolf.
+resume_in_progress = False
+
+
+def log_event(text):
+    """Record a timestamped line in the event log, the controller log and stdout."""
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}"
+    with log_lock:
+        event_log_buffer.append(line)
+    write_controller_log(line)
+    print(line)
+
+
 def save_detector_state(running):
     """Remember whether the detector is meant to be listening.
 
@@ -207,7 +226,17 @@ def save_detector_state(running):
         tmp_path = DETECTOR_STATE_FILE + '.tmp'
         with open(tmp_path, 'w') as f:
             json.dump({'running': bool(running)}, f)
+            # This flag exists to survive a power cut, so it has to reach the card
+            # before one: without the fsyncs the write can still be in the page
+            # cache, and the rename itself can be lost, when the power goes.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, DETECTOR_STATE_FILE)
+        dir_fd = os.open(os.path.dirname(DETECTOR_STATE_FILE) or '.', os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception as e:
         print(f"Warning: could not save detector state to {DETECTOR_STATE_FILE}: {e}")
 
@@ -241,27 +270,55 @@ def resume_detector_after_boot():
     """
     if not detector_was_running():
         return
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    note = (f"[{timestamp}] Detector was running when the monitor last went down "
-            "- resuming")
-    with log_lock:
-        event_log_buffer.append(note)
-    write_controller_log(note)
+    log_event("Detector was running when the monitor last went down - resuming")
+    threading.Thread(target=_resume_worker, daemon=True).start()
 
-    # Never let a failed resume take the dashboard down with it: this runs
-    # unattended at boot, and a phone that can still reach the page and press
-    # START is worth far more than a clean traceback in the journal.
+
+def _resume_worker():
+    """Keep trying to bring the detector up, then escalate if it will not come.
+
+    Retries because USB is not guaranteed to have enumerated by the time systemd
+    reaches this service: the detector exits rather than waiting for a mic that
+    is not there yet, and a single attempt at the wrong moment would leave the
+    night unmonitored. Runs on its own thread so the dashboard is reachable
+    immediately - that page is the manual way out if all of this fails.
+    """
+    global resume_in_progress
+    resume_in_progress = True
     try:
-        success, message = start_detector()
-    except Exception as e:
-        success, message = False, f"{type(e).__name__}: {e}"
-    if not success:
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        failed = f"[{timestamp}] Could not resume the detector: {message}"
-        with log_lock:
-            event_log_buffer.append(failed)
-        write_controller_log(failed)
-        print(failed)
+        _resume_attempts()
+    finally:
+        resume_in_progress = False
+
+
+def _resume_attempts():
+    for attempt in range(1, RESUME_ATTEMPTS + 1):
+        # A failed resume must never take the dashboard down with it
+        try:
+            started, message = start_detector()
+        except Exception as e:
+            started, message = False, f"{type(e).__name__}: {e}"
+
+        if started:
+            # Popen succeeding only means it launched; a missing mic exits right
+            # afterwards, and process_monitor logs why
+            time.sleep(RESUME_STARTUP_GRACE)
+            if is_running():
+                return
+            message = "the detector exited immediately after starting"
+
+        if attempt < RESUME_ATTEMPTS:
+            log_event(f"Resume attempt {attempt} failed ({message}); "
+                      f"retrying in {RESUME_RETRY_DELAY}s")
+            time.sleep(RESUME_RETRY_DELAY)
+            continue
+
+        log_event(f"Could not resume the detector after {attempt} attempts "
+                  f"({message}) - NOT monitoring")
+        # A clean reboot pauses the healthcheck on the way down, so without this
+        # a resume that never succeeds is silent: nothing listening, nothing due
+        # to ping, nobody told.
+        fail_healthcheck()
 
 
 # ANSI color code stripping
@@ -396,8 +453,9 @@ def process_monitor(process):
         extra = None
     else:
         # Crash, bad argument, or an outside kill: leave monitoring armed and
-        # escalate now rather than pausing the check
-        hc_failed = fail_healthcheck()
+        # escalate now rather than pausing the check - unless the boot resume is
+        # still retrying, which escalates once at the end if it never succeeds
+        hc_failed = False if resume_in_progress else fail_healthcheck()
         reason = (f"killed by signal {-returncode}" if returncode < 0
                   else f"exit code {returncode}")
         msg = f"[{timestamp}] Detector exited UNEXPECTEDLY ({reason}) - NOT monitoring"
@@ -1487,11 +1545,14 @@ def api_start():
 def api_stop():
     """Stop the detector"""
     success, message = stop_detector()
-    if success:
-        # Only an explicit STOP ends the session. cleanup() also stops the
-        # detector when the controller itself is signalled (a service restart, a
-        # clean reboot), and that must still resume afterwards.
-        save_detector_state(False)
+    # Unconditionally: stop_detector() reports failure when the detector has
+    # already crashed, and pressing STOP on a crash banner still means the parent
+    # is ending the session, not asking for it back at the next boot.
+    #
+    # Only an explicit STOP ends a session. cleanup() also stops the detector when
+    # the controller itself is signalled (a service restart, a clean reboot), and
+    # those must still resume afterwards, so the clearing lives here.
+    save_detector_state(False)
     return jsonify({'success': success, 'message': message})
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -1545,6 +1606,19 @@ def api_config():
 
     return jsonify(current_config)
 
+def port_is_free(host, port):
+    """Whether the web port can still be bound, so we do not resume over a
+    controller that is already running."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
 def cleanup(signum=None, frame=None):
     """Cleanup on exit"""
     stop_detector()
@@ -1568,7 +1642,13 @@ if __name__ == '__main__':
     print(f"Open http://<your-pi-ip>:{args.port} on your phone")
     print(f"Press Ctrl+C to stop")
 
-    # Under __main__ only: importing this module must never spawn a detector
-    resume_detector_after_boot()
+    # Check the port before resuming: app.run() binds it below, and a second
+    # instance that dies on "Address already in use" would otherwise leave the
+    # detector it just spawned running in its own process group, untracked.
+    if port_is_free(args.host, args.port):
+        # Under __main__ only: importing this module must never spawn a detector
+        resume_detector_after_boot()
+    else:
+        print(f"Port {args.port} is already in use; not resuming the detector")
 
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

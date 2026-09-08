@@ -238,6 +238,17 @@ class PowerCutResumeTests(fakes.WebControllerTestCase):
     alert alone, is indistinguishable from the power still being out.
     """
 
+    def setUp(self):
+        super().setUp()
+        # the real resume waits between attempts and after launching; tests must not
+        self._delays = (self.wc.RESUME_RETRY_DELAY, self.wc.RESUME_STARTUP_GRACE)
+        self.wc.RESUME_RETRY_DELAY = 0
+        self.wc.RESUME_STARTUP_GRACE = 0
+
+    def tearDown(self):
+        self.wc.RESUME_RETRY_DELAY, self.wc.RESUME_STARTUP_GRACE = self._delays
+        super().tearDown()
+
     def start_with_fake_process(self):
         process = self.spawn(RUN_FOREVER)
         original_popen = subprocess.Popen
@@ -247,21 +258,38 @@ class PowerCutResumeTests(fakes.WebControllerTestCase):
         finally:
             subprocess.Popen = original_popen
 
-    def resume(self, outcome=(True, 'started')):
-        """Run the boot-time resume with a stubbed start; did it try to start?"""
+    def resume(self, *outcomes):
+        """Run the boot resume with a scripted start; return the attempt count.
+
+        Each outcome scripts one attempt: 'ok' plants a live process, since the
+        resume confirms the detector survived startup rather than trusting that
+        it launched; 'exits' launches and dies, as a detector does when the USB
+        mic has not enumerated yet; 'refuses' fails to launch; 'raises' throws.
+        The last outcome repeats, so a single one describes every attempt.
+        """
+        outcomes = outcomes or ('ok',)
         calls = []
 
         def fake_start():
-            calls.append(True)
-            return outcome
+            outcome = outcomes[min(len(calls), len(outcomes) - 1)]
+            calls.append(outcome)
+            if outcome == 'ok':
+                self.wc.detector_process = self.spawn(RUN_FOREVER)
+                return True, 'started'
+            if outcome == 'exits':
+                self.wc.detector_process = None
+                return True, 'started'
+            if outcome == 'raises':
+                raise PermissionError('/var/log/babymonitor')
+            return False, 'Failed to start: boom'
 
         original = self.wc.start_detector
         self.wc.start_detector = fake_start
         try:
-            self.wc.resume_detector_after_boot()
+            fakes.run_and_join(self.wc, self.wc.resume_detector_after_boot)
         finally:
             self.wc.start_detector = original
-        return bool(calls)
+        return len(calls)
 
     def test_starting_records_that_the_detector_should_be_listening(self):
         ok, _ = self.start_with_fake_process()
@@ -270,9 +298,9 @@ class PowerCutResumeTests(fakes.WebControllerTestCase):
 
     def test_a_reboot_resumes_an_interrupted_session(self):
         self.start_with_fake_process()
-        self.assertTrue(self.resume(),
-                        "a power cut would leave the baby unmonitored until "
-                        "someone noticed and pressed START")
+        self.assertEqual(self.resume(), 1,
+                         "a power cut would leave the baby unmonitored until "
+                         "someone noticed and pressed START")
 
     def test_the_resume_is_explained_in_the_event_log(self):
         self.start_with_fake_process()
@@ -284,15 +312,25 @@ class PowerCutResumeTests(fakes.WebControllerTestCase):
         self.start_with_fake_process()
         self.client.post('/api/stop')
         self.assertFalse(self.wc.detector_was_running())
-        self.assertFalse(self.resume(),
+        self.assertEqual(self.resume(), 0,
                          "a session stopped on purpose must stay stopped")
+
+    def test_stopping_after_a_crash_also_ends_the_session(self):
+        # stop_detector() reports failure once the process has already died, so
+        # gating on it left the flag set and resumed a session the parent ended
+        self.start_with_fake_process()
+        self.wc.detector_process = None
+        response = self.client.post('/api/stop')
+        self.assertFalse(response.get_json()['success'])
+        self.assertFalse(self.wc.detector_was_running())
+        self.assertEqual(self.resume(), 0)
 
     def test_a_clean_auto_stop_ends_the_session_for_good(self):
         self.start_with_fake_process()
         process = self.spawn(EXIT_CLEAN)
         self.wc.detector_process = process
         self.wc.process_monitor(process)
-        self.assertFalse(self.resume(),
+        self.assertEqual(self.resume(), 0,
                          "--stop-at ended the night deliberately")
 
     def test_a_crash_is_retried_on_the_next_boot(self):
@@ -300,49 +338,90 @@ class PowerCutResumeTests(fakes.WebControllerTestCase):
         process = self.spawn(EXIT_CRASH)
         self.wc.detector_process = process
         self.wc.process_monitor(process)
-        self.assertTrue(self.resume(),
-                        "a fresh boot may well cure whatever it died of")
+        self.assertEqual(self.resume(), 1,
+                         "a fresh boot may well cure whatever it died of")
 
     def test_restarting_the_controller_still_resumes(self):
         # cleanup() stops the detector when the service is restarted or the Pi is
         # rebooted cleanly, and there the user never asked to stop monitoring
         self.start_with_fake_process()
         self.wc.stop_detector()
-        self.assertTrue(self.resume())
+        self.assertEqual(self.resume(), 1)
 
     def test_a_fresh_install_starts_nothing(self):
         self.assertFalse(os.path.exists(self.wc.DETECTOR_STATE_FILE))
-        self.assertFalse(self.resume())
+        self.assertEqual(self.resume(), 0)
 
     def test_an_unreadable_state_file_starts_nothing(self):
         with open(self.wc.DETECTOR_STATE_FILE, 'w') as f:
             f.write('{ not json')
         self.assertFalse(self.wc.detector_was_running())
-        self.assertFalse(self.resume())
+        self.assertEqual(self.resume(), 0)
+
+    def test_a_mic_that_appears_late_is_waited_for(self):
+        # systemd can reach this service before USB has enumerated; the detector
+        # exits rather than waiting, so one attempt at the wrong moment would
+        # have left the whole night unmonitored
+        self.start_with_fake_process()
+        attempts = self.resume('exits', 'ok')
+        self.assertEqual(attempts, 2)
+        self.assertTrue(self.wc.is_running())
+        self.assertEqual(self.healthcheck_calls, [],
+                         "it came up in the end; nothing to escalate")
+
+    def test_a_late_mic_does_not_page_the_parent_on_the_way_up(self):
+        # process_monitor escalates every unexpected exit, so a first attempt
+        # that lost the race with USB used to send a 2am "monitor is down" that
+        # then cleared itself - the false alarm this whole feature exists to avoid
+        self.start_with_fake_process()
+        self.resume('exits', 'ok')
+        self.assertEqual(self.healthcheck_calls, [],
+                         "a retryable boot failure must not cry wolf")
+
+    def test_a_detector_that_keeps_exiting_gives_up_and_escalates(self):
+        self.start_with_fake_process()
+        attempts = self.resume('exits')
+        self.assertEqual(attempts, self.wc.RESUME_ATTEMPTS)
+        joined = ' '.join(self.events())
+        self.assertIn('exited immediately', joined)
+        self.assertIn('NOT monitoring', joined)
+
+    def test_giving_up_escalates_through_healthchecks(self):
+        # a clean reboot pauses the check on the way down, so a resume that never
+        # succeeds is otherwise silent: nothing listening, nothing due to ping
+        self.start_with_fake_process()
+        self.resume('refuses')
+        self.assertIn('fail', self.healthcheck_calls)
 
     def test_a_resume_that_fails_says_so_in_the_event_log(self):
-        self.wc.save_detector_state(True)
-        self.resume(outcome=(False, 'Failed to start: boom'))
+        self.start_with_fake_process()
+        self.resume('refuses')
         self.assertTrue(any('Could not resume' in event for event in self.events()))
 
     def test_a_resume_that_raises_does_not_take_the_dashboard_down(self):
         # runs unattended at boot: an unwritable log dir or a bad SD card must
         # still leave a page the phone can reach and press START on
-        self.wc.save_detector_state(True)
-        original = self.wc.start_detector
+        self.start_with_fake_process()
+        self.resume('raises')
+        joined = ' '.join(self.events())
+        self.assertIn('Could not resume', joined)
+        self.assertIn('PermissionError', joined)
+        self.assertIsNotNone(self.client.get('/api/status').get_json(),
+                             "the dashboard must still answer")
 
-        def exploding_start():
-            raise PermissionError("/var/log/babymonitor")
 
-        self.wc.start_detector = exploding_start
-        try:
-            self.wc.resume_detector_after_boot()
-        finally:
-            self.wc.start_detector = original
-        self.assertTrue(any('Could not resume' in event for event in self.events()))
-        self.assertTrue(any('PermissionError' in event for event in self.events()))
-        self.assertTrue(self.client.get('/api/status').get_json() is not None,
-                        "the dashboard must still answer")
+class ResumePortGuardTests(fakes.WebControllerTestCase):
+    def test_a_port_already_in_use_is_reported_as_busy(self):
+        # app.run() binds the port after the resume; a second instance that dies
+        # on "Address already in use" would leave an untracked detector running
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+            taken.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            taken.bind(('127.0.0.1', 0))
+            taken.listen(1)
+            port = taken.getsockname()[1]
+            self.assertFalse(self.wc.port_is_free('127.0.0.1', port))
+        self.assertTrue(self.wc.port_is_free('127.0.0.1', port))
 
 
 if __name__ == '__main__':
