@@ -410,7 +410,13 @@ class WebControllerTestCase(unittest.TestCase):
         wc._last_saved_config = None
         wc.detector_process = None
         wc.running_status_port = None
+        wc.detector_started_at = None
         wc.last_failure = None
+        # the daily restart fires at most once per slot, so its bookkeeping has
+        # to be cleared or the second test of a slot sees it as already done
+        wc._restart_done_slot = None
+        wc._restart_pending_slot = None
+        wc._restart_pending_since = None
         wc.stopping_pids.clear()
         wc.log_buffer.clear()
         wc.event_log_buffer.clear()

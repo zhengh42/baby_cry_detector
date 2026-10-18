@@ -51,7 +51,7 @@ PUSHOVER_API_TOKEN = "your_api_token"
 
 ### 3. Set up Healthchecks.io (optional)
 
-Healthchecks.io monitors the Pi's uptime and alerts you if the script stops running (crash, power outage, wifi down, etc.). It also receives /fail pings if the microphone goes silent or Pushover notification delivery fails.
+Healthchecks.io monitors the Pi's uptime and alerts you if the script stops running (crash, power outage, wifi down, etc.). It also receives /fail pings when the monitor knows something is wrong and does not want you waiting out the check's period: the microphone goes silent or its audio stream is down, an emergency Pushover notification gives up, the detector exits unexpectedly, a boot resume cannot bring it back, or a restart cannot start a new detector.
 
 1. Create a free account at [healthchecks.io](https://healthchecks.io)
 2. Create a new check with a period slightly longer than your heartbeat interval (e.g., 12 minutes for a 10-minute heartbeat)
@@ -131,15 +131,16 @@ The recommended way to run the monitor. Open `http://<your-pi-ip>:5000` on your 
 - Live status display with emojis (sleeping/crying/alarm/mic silent/no audio)
 - Crying duration and silence timer in H:MM:SS format
 - "Who is on duty?" device selector — switch who gets alerted instantly, or mute notifications entirely
-- Configuration form for all detector parameters — changes apply instantly to the running detector (no restart needed) and sync live across all open phones without refreshing
+- Configuration form for every detector parameter, saved the moment you change it and synced live across all open phones without refreshing. Detection settings (volume, cry frequency, alert/reset windows, min cry, silence gap) are pushed straight into the running detector; the ones it can only read at startup (Stop At, Healthcheck, Recording, Heartbeat, status port) wait for the next start, and the page says so
 - Event log and real-time log viewer with auto-scroll — configuration changes (alert/reset windows, device/mute switches, etc.) are recorded in the event log
 - Settings persist across restarts and reboots (saved to `monitor_config.json`)
-- Resumes monitoring by itself after a power cut: if the detector was listening when the Pi lost power, it starts again on boot (recorded in `detector_state.json`). Retries a few times in case the USB mic has not enumerated yet, and escalates through the healthcheck if it never comes up. Pressing STOP or reaching `--stop-at` ends the session for good, so only an interrupted one is resumed
+- Hands the detector a fresh process every morning (on by default at 09:00; "Restart At" on the phone, where it can be retimed or switched off). A run's log only moves to the USB drive when the run ends, so a session left listening for days never archives one — and it outlives the USB audio stack under it besides. Ending the run cures both and costs a second; a stopped monitor is left stopped, a crying baby is not interrupted (it waits for a quiet moment, up to 30 minutes), and a restart that cannot bring the detector back escalates through the healthcheck instead of going quiet
+- Resumes monitoring by itself after a power cut: if the detector was listening when the Pi lost power, it starts again on boot (recorded in `detector_state.json`). Retries a few times in case the USB mic has not enumerated yet, and escalates through the healthcheck if it never comes up. Pressing STOP or reaching `--stop-at` ends the session for good, so only an interrupted one is resumed; a restart (RESTART or the morning one) deliberately leaves it armed, so a power cut during one still comes back monitoring
 - Event log is kept across detector sessions, and config changes are also appended to `/var/log/babymonitor/controller.log`
 - Shows NO AUDIO if the detector loses the microphone, instead of reporting "all quiet"
-- Red banner if the detector exits unexpectedly (crash, bad setting), with the error and a Dismiss button; the healthcheck is only paused on a clean stop, so a crash still escalates
+- Red banner if the detector exits unexpectedly (crash, bad setting) or a restart cannot start a new one, with the error and a Dismiss button; the healthcheck is only paused on a clean stop, so a crash still escalates
 - Auto-pauses healthcheck when stopping (prevents false alerts)
-- Log files moved to the USB drive when a session ends, whether it ends with STOP or at its own `--stop-at` time; a crashed run keeps its log on the card to be read, and only the newest 20 are kept there
+- Log files moved to the USB drive when a run ends, whether it ends with STOP, at its own `--stop-at` time, or because a restart replaced it; a crashed run keeps its log on the card to be read, and only the newest 20 are kept there. Run logs are named for their start second and never opened over an existing one, so two runs starting in the same second get separate files
 
 ### Cry Detector CLI (`cry_detector.py`)
 
@@ -152,6 +153,7 @@ python cry_detector.py --pushover --healthcheck https://hc-ping.com/your-uuid
 **Options:**
 - `-v, --volume` - Volume threshold
 - `--cry-freq-min` - Minimum cry frequency in Hz
+- `-r, --ratio` - Share of a chunk's spectrum that has to fall inside the cry band for a loud chunk to count as crying even when its dominant frequency sits outside the band (default: 0.4)
 - `--record` - Enable recording of crying episodes
 - `--pushover` - Enable Pushover emergency notifications
 - `--pushover-device` - Pushover device name to send to (use `__muted__` to suppress notifications while still monitoring)
@@ -188,7 +190,8 @@ skipped automatically if `flask` is not installed.
 | `test_stream_health.py` | dead or unplugged mic, reconnect, recovery, silent-mic alert |
 | `test_status_server.py` | `/status` payload, `/config` clamping and rejection, localhost binding |
 | `test_config_api.py` | setting limits, device whitelist, `stop_at`, persistence |
-| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning, power-cut resume, one detector per mic, log archiving |
+| `test_lifecycle.py` | exit classification, healthcheck policy, force stop, port pinning, power-cut resume, one detector per mic, log archiving and naming |
+| `test_restart.py` | replacing a running detector: the morning restart (once a day, never starting a stopped monitor, deferred around a crying baby, escalating a start that fails) and the phone's one-request RESTART |
 | `test_autostop.py` | `--stop-at` fires even when the loop is sleeping through a dead mic, and not on a session started inside that minute |
 | `test_heartbeat.py` | heartbeat retry bounds and thread cleanup |
 | `test_notifications.py` | emergency alert retried through a brief outage, never sent on the monitor loop |

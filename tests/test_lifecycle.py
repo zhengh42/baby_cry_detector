@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import unittest
+from datetime import datetime
 
 import fakes
 
@@ -556,6 +557,70 @@ class LogHousekeepingTests(fakes.WebControllerTestCase):
             self.assertNotIn('exited normally', handle.read())
         self.assertEqual(os.listdir(self.wc.USB_LOG_DIR),
                          ['detector_20260101_220000.log'])
+
+    def test_a_second_session_in_the_same_minute_gets_its_own_log(self):
+        """Two sessions can share a start second - a fast STOP then START, or a
+        restart whose settle delay someone has tuned down. The name is only
+        second-resolution, and the second session used to open it with 'w': on a
+        card whose USB archive failed, that truncated the first session's log."""
+        existing = self.make_log('detector_20260101_220000.log')
+        with open(existing, 'w') as handle:
+            handle.write('[02:26] ALERT sent to papa\n')
+        when = datetime(2026, 1, 1, 22, 0, 0)
+
+        path = self.wc.new_log_path(when)
+
+        self.assertNotEqual(path, existing)
+        with open(existing) as handle:
+            self.assertIn('ALERT sent to papa', handle.read())
+
+    def test_a_third_session_in_the_same_second_gets_its_own_log_too(self):
+        when = datetime(2026, 1, 1, 22, 0, 0)
+        self.make_log('detector_20260101_220000.log')
+        self.make_log('detector_20260101_220000_2.log')
+        self.assertTrue(self.wc.new_log_path(when).endswith('_3.log'))
+
+    def test_an_unclaimed_second_keeps_the_plain_name(self):
+        when = datetime(2026, 1, 1, 22, 0, 0)
+        self.assertTrue(self.wc.new_log_path(when)
+                        .endswith('detector_20260101_220000.log'))
+
+    def test_a_name_already_archived_to_usb_is_not_reused(self):
+        """Archiving hands the name back on the card, but the archived copy
+        still answers to it - and archive_log() copies by basename and
+        overwrites, so reusing the name would cost the archived run its log."""
+        os.makedirs(self.wc.USB_LOG_DIR, exist_ok=True)
+        archived = os.path.join(self.wc.USB_LOG_DIR,
+                                'detector_20260101_220000.log')
+        with open(archived, 'w') as handle:
+            handle.write('[02:26] ALERT sent to papa\n')
+
+        path = self.wc.new_log_path(datetime(2026, 1, 1, 22, 0, 0))
+
+        self.assertTrue(path.endswith('_2.log'))
+        with open(archived) as handle:
+            self.assertIn('ALERT sent to papa', handle.read())
+
+    def test_an_archive_that_fails_is_announced_rather_than_printed(self):
+        """Getting the log onto the USB drive is the whole point of the daily
+        restart, and prune_old_logs() deletes it off the card 20 runs later. A
+        drive that is not mounted must not fail quietly."""
+        self.wc.LOG_FILE = self.make_log('detector_20260101_220000.log')
+        self.wc.USB_LOG_DIR = os.path.join(self.wc.LOG_DIR,
+                                           'detector_20260101_220000.log',
+                                           'not-a-directory')
+
+        self.wc.archive_log()
+
+        self.assertTrue(any('NOT archived' in event for event in self.events()))
+        self.assertTrue(os.path.exists(self.wc.LOG_FILE),
+                        "a log that did not reach USB stays on the card")
+
+    def test_a_suffixed_log_is_still_archived_and_pruned_like_any_other(self):
+        self.wc.LOG_FILE = self.make_log('detector_20260101_220000_2.log')
+        self.watch_exit(EXIT_CLEAN)
+        self.assertEqual(os.listdir(self.wc.USB_LOG_DIR),
+                         ['detector_20260101_220000_2.log'])
 
     def test_starting_keeps_only_the_newest_logs(self):
         kept = self.wc.MAX_KEPT_LOGS

@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     'silence_gap': 2,      # seconds
     'enable_stop_at': False,
     'stop_at': '07:00',
+    'enable_restart_at': True,
+    'restart_at': '09:00',
     'status_port': 8080,
     'pushover': True,
     'pushover_device': 'a_phone',
@@ -101,6 +103,8 @@ last_failure = None    # last unexpected detector exit, shown as a banner on eve
                        # phone until dismissed or a new detector is started
 running_status_port = None  # status port the live detector was launched with; not
                             # cleared on exit because every use is behind is_running()
+detector_started_at = None  # when the live detector was launched, so the daily
+                            # restart can leave a session it just missed alone
 current_config = DEFAULT_CONFIG.copy()
 config_lock = threading.Lock()
 # Serialises START and STOP. Flask serves requests on threads, so two phones (or
@@ -110,7 +114,11 @@ config_lock = threading.Lock()
 # no longer tracking: the dashboard says STOPPED, STOP does nothing, and the
 # orphan's heartbeats keep the healthcheck green. Nothing short of ssh gets you
 # out of that, so the check and the spawn have to happen as one step.
-process_lock = threading.Lock()
+#
+# Reentrant so the daily restart can hold it across its stop and its start: a
+# phone that pressed START in the gap would own a detector this one is about to
+# replace, which is the same orphan as above by another route.
+process_lock = threading.RLock()
 _last_saved_config = None  # last snapshot written to disk, to skip no-op saves
 log_buffer = deque(maxlen=100)  # Keep last 100 log lines
 event_log_buffer = deque(maxlen=300)  # Key events only
@@ -154,7 +162,7 @@ def sanitize_config_value(key, value):
     if key == 'pushover_device':
         # isinstance first: `value in DEVICE_LABELS` raises TypeError on a list/dict
         return (True, value) if isinstance(value, str) and value in DEVICE_LABELS else (False, None)
-    if key == 'stop_at':
+    if key in ('stop_at', 'restart_at'):
         # A malformed time makes the detector exit(1) at startup, so normalise
         # it here (07:00) or reject it outright
         try:
@@ -360,9 +368,11 @@ CONFIG_LABELS = {
     'min_cry': ('Min cry duration', ' sec'),
     'silence_gap': ('Silence gap', ' sec'),
     'stop_at': ('Stop-at time', ''),
+    'restart_at': ('Daily restart time', ''),
     'status_port': ('Status port', ''),
     'heartbeat': ('Heartbeat interval', ' min'),
     'enable_stop_at': ('Stop-at', None),
+    'enable_restart_at': ('Daily restart', None),
     'enable_healthcheck': ('Healthcheck', None),
     'record': ('Recording', None),
     'pushover': ('Pushover alerts', None),
@@ -433,7 +443,12 @@ def archive_log(path=None):
         os.remove(path)
         print(f"Log moved to {USB_LOG_DIR}/{os.path.basename(path)}")
     except Exception as e:
-        print(f"Failed to move log to USB: {e}")
+        # The daily restart exists to get this file onto the USB drive, so a
+        # failure here is that feature quietly not working - and in
+        # MAX_KEPT_LOGS runs' time prune_old_logs() deletes the log off the
+        # card. Say so where a parent will see it, not only in journalctl.
+        log_event(f"Log NOT archived to USB ({e}) - {os.path.basename(path)} "
+                  f"is still on the card")
 
 
 def prune_old_logs():
@@ -457,6 +472,30 @@ def prune_old_logs():
             print(f"Removed old log {os.path.basename(path)}")
         except Exception:
             pass
+
+
+def new_log_path(when):
+    """A run-log path for `when` that no existing log already owns.
+
+    The name is the start time to the second, which is not by itself unique:
+    two sessions started inside one second would name the same file, and the
+    second would open it with 'w' and truncate the first. That is only
+    survivable while the earlier log has already been archived - and it has not
+    when the USB drive is unmounted, nor after a crash, whose log is
+    deliberately left on the card to be read.
+
+    The archive owns a name too. Archiving hands the name back on the card, but
+    archive_log() copies onto the USB drive by basename and overwrites, so the
+    run already filed under it would lose its log to the next one.
+    """
+    stamp = f"detector_{when.strftime('%Y%m%d_%H%M%S')}"
+    attempt = 1
+    while True:
+        name = f"{stamp}.log" if attempt == 1 else f"{stamp}_{attempt}.log"
+        if not (os.path.exists(os.path.join(LOG_DIR, name))
+                or os.path.exists(os.path.join(USB_LOG_DIR, name))):
+            return os.path.join(LOG_DIR, name)
+        attempt += 1
 
 
 def log_reader(process, log_file_path):
@@ -583,6 +622,7 @@ def process_monitor(process, log_path=None):
 def start_detector():
     """Start the cry detector process"""
     global detector_process, log_buffer, LOG_FILE, last_failure, running_status_port
+    global detector_started_at
 
     if detector_process is not None and detector_process.poll() is None:
         return False, "Detector is already running"
@@ -591,9 +631,8 @@ def start_detector():
     os.makedirs(LOG_DIR, exist_ok=True)
     prune_old_logs()
 
-    # Create log file with timestamp
-    log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    LOG_FILE = os.path.join(LOG_DIR, f"detector_{log_timestamp}.log")
+    # Create log file, named for the start time but never over an existing log
+    LOG_FILE = new_log_path(datetime.now())
 
     # Build command
     cmd = [
@@ -658,6 +697,8 @@ def start_detector():
         monitor_thread = threading.Thread(target=process_monitor,
                                           args=(detector_process, LOG_FILE), daemon=True)
         monitor_thread.start()
+
+        detector_started_at = datetime.now()
 
         # A fresh start clears the previous crash banner
         last_failure = None
@@ -794,6 +835,206 @@ def is_running():
         detector_process = None
         return False
     return True
+
+
+# --- daily restart ---------------------------------------------------------
+#
+# A run's log only moves to the USB drive when the run ends - archive_log() is
+# on the stop and auto-stop paths, nowhere else - so a session that never ends
+# never archives. The detector is meant to run for a night at a time, but it
+# can be left listening for days, and then the night's log sits on the card
+# until prune_old_logs() deletes it unread.
+#
+# The things under the detector are no more patient: the USB mic drops off the
+# bus, and ALSA hands back a stream that reads silence. Ending the run cures
+# all of it and costs a second, so one is ended every morning rather than
+# waiting for someone to notice.
+#
+# The schedule lives here rather than in the detector (where --stop-at lives)
+# because a process cannot restart itself: only the controller that spawned it
+# can hand it a successor.
+RESTART_POLL_SECONDS = 20     # must stay well under a minute; the restart time is
+                              # matched by the minute, like the detector's auto-stop
+RESTART_SETTLE_SECONDS = 1    # pause between the stop and the start, so ALSA has
+                              # let go of the USB mic before the next process opens it
+RESTART_MIN_SESSION_AGE = 60  # don't restart a session this young (seconds)
+# How long to keep waiting for a quiet moment before giving up on today's restart.
+# Restarting mid-episode would reset the alert timer, so a baby crying at the
+# restart time would have its alarm pushed back by a whole alert window.
+RESTART_DEFER_LIMIT = 30 * 60
+
+_restart_done_slot = None      # (date, 'HH:MM') the restart has been settled for
+_restart_pending_slot = None   # slot that came due but is waiting for quiet
+_restart_pending_since = None  # when that wait began
+
+
+def detector_is_crying():
+    """Whether the running detector says an episode is in progress.
+
+    An unreachable or unparseable status counts as not crying: a detector that
+    cannot answer is the strongest case there is for replacing it, so the
+    restart must not be blocked by one.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(detector_endpoint('/status'), timeout=2) as response:
+            status = json.loads(response.read().decode())
+        return bool(status.get('crying')) if isinstance(status, dict) else False
+    except Exception:
+        return False
+
+
+@serialized
+def restart_detector(reason):
+    """Replace the running detector with a fresh one.
+
+    Stop and start are one step under process_lock: a phone that pressed START
+    in between would be left owning a detector this restart then replaces.
+
+    The stop pauses the healthcheck, as every clean stop does. That is only
+    safe because the successor sends its first heartbeat on its first pass of
+    the monitor loop, which resumes the check a second later - so if the start
+    fails instead, this has to escalate by hand.
+    """
+    global last_failure
+
+    if not is_running():
+        return False, "Detector is not running"
+
+    log_event(f"{reason}: restarting the detector")
+    stopped, message = stop_detector()
+    if not stopped:
+        # The old detector is probably still listening, so this is a failed
+        # restart, not a gap in monitoring: say so and leave it alone.
+        log_event(f"{reason} aborted: could not stop the detector ({message})")
+        return False, message
+
+    time.sleep(RESTART_SETTLE_SECONDS)
+
+    started, message = start_detector()
+    if started:
+        log_event(f"{reason}: detector restarted")
+        return True, message
+
+    # The mic has been taken away and could not be given back. stop_detector()
+    # paused the healthcheck on the way out, which would now keep the one alert
+    # that says nobody is watching the baby from ever firing.
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    escalated = fail_healthcheck()
+    note = " (healthcheck FAIL sent)" if escalated else ""
+    log_event(f"{reason} FAILED to start the detector ({message}) - NOT monitoring{note}")
+    last_failure = {
+        'time': timestamp,
+        'reason': f"{reason} could not start a new detector",
+        'detail': message,
+        'escalated': bool(escalated),
+    }
+    return False, message
+
+
+def _restart_slot(now, at):
+    """The identity of one day's restart, so it can fire at most once."""
+    return (now.date().isoformat(), at)
+
+
+def _is_restart_minute(now, at):
+    """Whether `now` falls in the minute named by `at` ('HH:MM').
+
+    Matched against the clock as it reads now, not a deadline computed in
+    advance: the Pi has no battery-backed clock, so it comes back from a power
+    cut believing it is still the time of the cut and NTP then jumps it forward.
+    A missed minute therefore just does not match, and today's restart is
+    skipped - which costs nothing, where a restart fired by a clock jump would
+    land in the middle of a night.
+    """
+    try:
+        wanted = datetime.strptime(at, '%H:%M')
+    except (TypeError, ValueError):
+        return False
+    return (now.hour, now.minute) == (wanted.hour, wanted.minute)
+
+
+def _settle_restart(slot):
+    """Mark one day's restart as dealt with, however it turned out."""
+    global _restart_done_slot, _restart_pending_slot, _restart_pending_since
+    _restart_done_slot = slot
+    _restart_pending_slot = _restart_pending_since = None
+
+
+def maybe_run_daily_restart(now=None):
+    """Run the daily restart if it is due. Returns True if one was attempted.
+
+    Called on a timer, so every path has to decide whether this slot is finished
+    with: anything that returns without restarting and without marking the slot
+    done will be asked again in RESTART_POLL_SECONDS.
+    """
+    global _restart_pending_slot, _restart_pending_since
+
+    now = datetime.now() if now is None else now
+    at = current_config.get('restart_at')
+
+    if not (current_config.get('enable_restart_at') and at):
+        # Turning the restart off also calls off one that is waiting for quiet
+        _restart_pending_slot = _restart_pending_since = None
+        return False
+
+    slot = _restart_slot(now, at)
+
+    # A wait that belongs to another slot is stale: the time was edited, or
+    # midnight arrived while the baby was still crying.
+    if _restart_pending_slot is not None and _restart_pending_slot != slot:
+        _restart_pending_slot = _restart_pending_since = None
+
+    if _restart_pending_slot == slot:
+        if (now - _restart_pending_since).total_seconds() >= RESTART_DEFER_LIMIT:
+            log_event(f"Daily restart ({at}) skipped: the baby has been crying "
+                      f"since it came due")
+            _settle_restart(slot)
+            return False
+    elif _restart_done_slot == slot or not _is_restart_minute(now, at):
+        return False
+
+    if not is_running():
+        # Nothing to refresh. A night that ended at its own stop-at time, or one
+        # a parent ended from the phone, stays ended - the restart keeps an
+        # existing session healthy, it does not start a new one.
+        _settle_restart(slot)
+        return False
+
+    if detector_started_at is not None:
+        # A session a parent (or the boot resume) started seconds ago is already
+        # as fresh as a restart would make it. A negative age means the clock has
+        # since jumped backwards, which leaves the real age unknowable; a
+        # needless restart is the cheaper mistake there than a skipped one.
+        age = (now - detector_started_at).total_seconds()
+        if 0 <= age < RESTART_MIN_SESSION_AGE:
+            _settle_restart(slot)
+            return False
+
+    if detector_is_crying():
+        if _restart_pending_slot != slot:
+            log_event(f"Daily restart ({at}) deferred: the baby is crying")
+            _restart_pending_slot, _restart_pending_since = slot, now
+        return False
+
+    _settle_restart(slot)
+    restart_detector(f"Daily restart ({at})")
+    return True
+
+
+def _restart_scheduler():
+    """Poll for the daily restart time. Never dies: this thread is the schedule."""
+    while True:
+        time.sleep(RESTART_POLL_SECONDS)
+        try:
+            maybe_run_daily_restart()
+        except Exception as e:
+            print(f"Daily restart check failed: {type(e).__name__}: {e}")
+
+
+def start_restart_scheduler():
+    """Begin watching for the daily restart time."""
+    threading.Thread(target=_restart_scheduler, daemon=True).start()
 
 # HTML template - mobile-friendly
 HTML_TEMPLATE = """
@@ -1107,6 +1348,14 @@ HTML_TEMPLATE = """
             <input type="text" id="stop_at" value="{{ config.stop_at }}" placeholder="HH:MM">
         </div>
 
+        <div class="form-group inline-option">
+            <input type="checkbox" id="enable_restart_at" {{ 'checked' if config.enable_restart_at else '' }}>
+            <label for="enable_restart_at" style="margin: 0; white-space: nowrap;">Restart At</label>
+            <input type="text" id="restart_at" value="{{ config.restart_at }}" placeholder="HH:MM">
+        </div>
+        <div class="restart-note">A session still listening at this time gets a fresh
+            detector; a stopped monitor stays stopped, and a crying baby waits.</div>
+
         <div class="form-group checkbox-group">
             <input type="checkbox" id="enable_healthcheck" {{ 'checked' if config.enable_healthcheck else '' }}>
             <label for="enable_healthcheck" style="margin: 0;">Enable Healthcheck</label>
@@ -1149,7 +1398,8 @@ HTML_TEMPLATE = """
 
         const NUMBER_FIELDS = ['volume', 'cry_freq_min', 'alert', 'reset', 'min_cry',
                                'silence_gap', 'heartbeat'];
-        const CHECK_FIELDS = ['enable_stop_at', 'enable_healthcheck', 'record'];
+        const CHECK_FIELDS = ['enable_stop_at', 'enable_restart_at', 'enable_healthcheck', 'record'];
+        const TIME_FIELDS = ['stop_at', 'restart_at'];
         // Same [min, max] the server enforces, injected so the two can't drift apart
         const FIELD_LIMITS = {{ config_limits|tojson }};
         // Accepted device values, from the server's whitelist
@@ -1193,7 +1443,7 @@ HTML_TEMPLATE = """
             await postConfig({[id]: val});
         }
 
-        // Typed-in numbers, the stop-at time, and the checkboxes save on change too
+        // Typed-in numbers, the HH:MM times, and the checkboxes save on change too
         function wireConfigInputs() {
             for (const id of NUMBER_FIELDS) {
                 const el = document.getElementById(id);
@@ -1211,9 +1461,13 @@ HTML_TEMPLATE = """
                     postConfig({[id]: e.target.checked});
                 });
             }
-            document.getElementById('stop_at').addEventListener('change', (e) => {
-                postConfig({stop_at: e.target.value});
-            });
+            for (const id of TIME_FIELDS) {
+                const el = document.getElementById(id);
+                if (!el) continue;
+                el.addEventListener('change', (e) => {
+                    postConfig({[id]: e.target.value});
+                });
+            }
         }
 
         async function selectDevice(device) {
@@ -1354,6 +1608,8 @@ HTML_TEMPLATE = """
                 silence_gap: parseInt(document.getElementById('silence_gap').value),
                 enable_stop_at: document.getElementById('enable_stop_at').checked,
                 stop_at: document.getElementById('stop_at').value,
+                enable_restart_at: document.getElementById('enable_restart_at').checked,
+                restart_at: document.getElementById('restart_at').value,
                 pushover: true,
                 pushover_device: selectedDevice,
                 enable_healthcheck: document.getElementById('enable_healthcheck').checked,
@@ -1401,27 +1657,24 @@ HTML_TEMPLATE = """
             // Same reason as startDetector: no second request while this one runs
             document.getElementById('btn-restart').disabled = true;
             document.getElementById('btn-start').disabled = true;
-            // Stop first
-            const stopResp = await fetch('/api/stop', {method: 'POST'});
-            const stopData = await stopResp.json();
-            if (!stopData.success) {
-                alert('Failed to stop: ' + stopData.message);
-                return;
-            }
-            // Brief delay to ensure clean shutdown
-            await new Promise(resolve => setTimeout(resolve, 500));
-            // Start with current config
-            const config = getConfig();
-            const startResp = await fetch('/api/start', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(config)
-            });
-            const startData = await startResp.json();
-            if (startData.success) {
-                updateUI(true, null);
-            } else {
-                alert('Failed to restart: ' + startData.message);
+            // One request, so the stop and the start happen under one lock on the
+            // controller: doing it here as a STOP then a START left a window for
+            // another phone to start a detector this restart would then replace.
+            // The status poll puts the buttons and the badge right if it fails.
+            try {
+                const resp = await fetch('/api/restart', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(getConfig())
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    updateUI(true, null);
+                } else {
+                    alert('Failed to restart: ' + data.message);
+                }
+            } catch (e) {
+                alert('Could not reach the monitor: ' + e);
             }
         }
 
@@ -1447,7 +1700,7 @@ HTML_TEMPLATE = """
             // would snap the field back to the pre-change value.
             if (configPending === 0) {
                 // Update number/text fields, but never clobber a field the user is editing
-                for (const id of NUMBER_FIELDS.concat(['stop_at'])) {
+                for (const id of NUMBER_FIELDS.concat(TIME_FIELDS)) {
                     const el = document.getElementById(id);
                     if (el && document.activeElement !== el && config[id] !== undefined
                         && String(el.value) !== String(config[id])) {
@@ -1643,6 +1896,31 @@ def api_stop():
     save_detector_state(False)
     return jsonify({'success': success, 'message': message})
 
+@app.route('/api/restart', methods=['POST'])
+def api_restart():
+    """Restart the detector as one step, applying any settings posted with it.
+
+    The phone used to do this itself, as a STOP followed by a START. Between the
+    two there was no detector and no lock held, so a second phone - or the daily
+    restart, or a boot resume - could start one that this restart then replaced,
+    leaving an untracked process holding the microphone. It also meant a power
+    cut inside that window came back with the session marked ended, because STOP
+    is what ends a session for good.
+    """
+    global current_config
+
+    if request.json:
+        if not isinstance(request.json, dict):
+            return jsonify({'success': False, 'message': 'Expected a JSON object'}), 400
+        clean, rejected = sanitize_config(request.json)
+        if rejected:
+            print(f"Ignored invalid settings on restart: {', '.join(sorted(rejected))}")
+        current_config.update(clean)
+        save_config()
+
+    success, message = restart_detector('Restart from the phone')
+    return jsonify({'success': success, 'message': message})
+
 @app.route('/api/config', methods=['GET', 'POST'])
 def api_config():
     """Get or update configuration, forwarding to running detector"""
@@ -1734,8 +2012,12 @@ if __name__ == '__main__':
     # instance that dies on "Address already in use" would otherwise leave the
     # detector it just spawned running in its own process group, untracked.
     if port_is_free(args.host, args.port):
-        # Under __main__ only: importing this module must never spawn a detector
+        # Under __main__ only: importing this module must never spawn a detector,
+        # and for the same reason neither may it schedule one
         resume_detector_after_boot()
+        start_restart_scheduler()
+        if current_config['enable_restart_at']:
+            print(f"Daily restart: {current_config['restart_at']}")
     else:
         print(f"Port {args.port} is already in use; not resuming the detector")
 
